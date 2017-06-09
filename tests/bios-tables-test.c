@@ -484,7 +484,8 @@ static bool load_asl(GArray *sdts, AcpiSdtTable *sdt)
 static GString *normalize_asl(gchar *asl_code)
 {
     GString *asl = g_string_new(asl_code);
-    gchar *comment, *block_name;
+    //gchar *comment, *block_name;
+    gchar *comment;
 
     /* strip comments (different generation days) */
     comment = g_strstr_len(asl->str, asl->len, COMMENT_END);
@@ -497,12 +498,16 @@ static GString *normalize_asl(gchar *asl_code)
     }
 
     /* strip def block name (it has file path in it) */
+    /*
     if (g_str_has_prefix(asl->str, DEF_BLOCK)) {
+        printf("asl->str: %s \n", asl->str);
+        printf("BLOCK_NAME_END: %s DEF_BLOCK: %s\n", BLOCK_NAME_END, DEF_BLOCK);
         block_name = g_strstr_len(asl->str, asl->len, BLOCK_NAME_END);
         g_assert(block_name);
         asl = g_string_erase(asl, 0,
                              block_name + sizeof(BLOCK_NAME_END) - asl->str);
     }
+    */
 
     return asl;
 }
