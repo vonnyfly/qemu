@@ -515,13 +515,17 @@
 #          to enable the capability on the source VM. The feature is disabled by
 #          default. (since 1.6)
 #
+# @events: generate events for each migration state change
+#          (since 2.4 )
+#
 # @auto-converge: If enabled, QEMU will automatically throttle down the guest
 #          to speed up convergence of RAM migration. (since 1.6)
 #
 # Since: 1.2
 ##
 { 'enum': 'MigrationCapability',
-  'data': ['xbzrle', 'rdma-pin-all', 'auto-converge', 'zero-blocks'] }
+  'data': ['xbzrle', 'rdma-pin-all', 'auto-converge', 'zero-blocks',
+           'events'] }
 
 ##
 # @MigrationCapabilityStatus
@@ -2329,12 +2333,16 @@
 #
 # @vhostforce: #optional vhost on for non-MSIX virtio guests (default: false).
 #
+# @queues: #optional number of queues to be created for multiqueue vhost-user
+#          (default: 1) (Since 2.5)
+#
 # Since 2.1
 ##
 { 'type': 'NetdevVhostUserOptions',
   'data': {
     'chardev':        'str',
-    '*vhostforce':    'bool' } }
+    '*vhostforce':    'bool',
+    '*queues':        'int' } }
 
 ##
 # @NetClientOptions
@@ -2734,6 +2742,21 @@
 # Since: 0.14.0
 ##
 { 'command': 'screendump', 'data': {'filename': 'str'} }
+
+##
+# @__com.redhat_qxl_screendump:
+#
+# Write a PPM of secondary qxl devices to a file.
+#
+# @id: qxl device id
+# @filename: the path of a new PPM file to store the image
+#
+# Returns: Nothing on success
+#
+# Since: never (rhel-only, not upstream)
+##
+{ 'command': '__com.redhat_qxl_screendump', 'data': { 'id' : 'str',
+                                                      'filename': 'str' } }
 
 ##
 # @ChardevFile:

@@ -97,7 +97,9 @@ static int s390_virtio_hcall_reset(const uint64_t *args)
         return -EINVAL;
     }
     virtio_reset(dev->vdev);
-    stb_phys(&address_space_memory, dev->dev_offs + VIRTIO_DEV_OFFS_STATUS, 0);
+    address_space_stb(&address_space_memory,
+                      dev->dev_offs + VIRTIO_DEV_OFFS_STATUS, 0,
+                      MEMTXATTRS_UNSPECIFIED, NULL);
     s390_virtio_device_sync(dev);
     s390_virtio_reset_idx(dev);
 
@@ -281,7 +283,7 @@ static void s390_init(MachineState *machine)
     s390_virtio_register_hcalls();
 
     /* allocate RAM */
-    memory_region_init_ram(ram, NULL, "s390.ram", my_ram_size, &error_abort);
+    memory_region_init_ram(ram, NULL, "s390.ram", my_ram_size, &error_fatal);
     vmstate_register_ram_global(ram);
     memory_region_add_subregion(sysmem, 0, ram);
 

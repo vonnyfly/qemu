@@ -253,6 +253,20 @@ Save screen into PPM image @var{filename}.
 ETEXI
 
     {
+        .name       = "__com.redhat_qxl_screendump",
+        .args_type  = "id:s,filename:F",
+        .params     = "id filename",
+        .help       = "save screen from qxl device 'id' into PPM image 'filename'",
+        .mhandler.cmd = hmp___com_redhat_qxl_screen_dump,
+    },
+
+STEXI
+@item __com.redhat_screendump @var{id} @var{filename}
+@findex __com.redhat_screendump
+Save screen from qxl device @var{id} into PPM image @var{filename}.
+ETEXI
+
+    {
         .name       = "logfile",
         .args_type  = "filename:F",
         .params     = "filename",
@@ -618,6 +632,7 @@ STEXI
 Compute the checksum of a memory region.
 ETEXI
 
+#if 0 /* Disabled for Red Hat Enterprise Linux */
     {
         .name       = "usb_add",
         .args_type  = "devname:s",
@@ -648,6 +663,7 @@ Remove the USB device @var{devname} from the QEMU virtual USB
 hub. @var{devname} has the syntax @code{bus.addr}. Use the monitor
 command @code{info usb} to see the devices you can remove.
 ETEXI
+#endif
 
     {
         .name       = "device_add",
@@ -1158,6 +1174,27 @@ Add drive to PCI storage controller.
 ETEXI
 
     {
+        .name       = RFQDN_REDHAT "drive_add",
+        .args_type  = "simple-drive:O",
+        .params     = "id=name,[file=file][,format=f][,media=d]...",
+        .help       = "Create a drive similar to -device if=none.",
+	.user_print = monitor_user_noop,
+        .mhandler.cmd_new = simple_drive_add,
+    },
+
+STEXI
+@item __com.redhat_drive_add
+@findex __com.redhat_drive_add
+Create a drive similar to -device if=none.
+ETEXI
+
+STEXI
+@item pci_del
+@findex pci_del
+Hot remove PCI device.
+ETEXI
+
+    {
         .name       = "pcie_aer_inject_error",
         .args_type  = "advisory_non_fatal:-a,correctable:-c,"
 	              "id:s,error_status:s,"
@@ -1182,6 +1219,7 @@ STEXI
 Inject PCIe AER error
 ETEXI
 
+#if 0 /* Disabled for Red Hat Enterprise Linux */
     {
         .name       = "host_net_add",
         .args_type  = "device:s,opts:s?",
@@ -1211,6 +1249,7 @@ STEXI
 @findex host_net_remove
 Remove host VLAN client.
 ETEXI
+#endif
 
     {
         .name       = "netdev_add",

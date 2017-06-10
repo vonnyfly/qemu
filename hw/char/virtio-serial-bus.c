@@ -75,7 +75,7 @@ static VirtIOSerialPort *find_port_by_name(char *name)
 static bool use_multiport(VirtIOSerial *vser)
 {
     VirtIODevice *vdev = VIRTIO_DEVICE(vser);
-    return virtio_has_feature(vdev, VIRTIO_CONSOLE_F_MULTIPORT);
+    return virtio_vdev_has_feature(vdev, VIRTIO_CONSOLE_F_MULTIPORT);
 }
 
 static size_t write_to_port(VirtIOSerialPort *port,
@@ -194,7 +194,8 @@ static size_t send_control_msg(VirtIOSerial *vser, void *buf, size_t len)
         return 0;
     }
 
-    memcpy(elem.in_sg[0].iov_base, buf, len);
+    /* TODO: detect a buffer that's too short, set NEEDS_RESET */
+    iov_from_buf(elem.in_sg, elem.in_num, 0, buf, len);
 
     virtqueue_push(vq, &elem, len);
     virtio_notify(VIRTIO_DEVICE(vser), vq);
@@ -498,7 +499,8 @@ static void handle_input(VirtIODevice *vdev, VirtQueue *vq)
     }
 }
 
-static uint32_t get_features(VirtIODevice *vdev, uint32_t features)
+static uint64_t get_features(VirtIODevice *vdev, uint64_t features,
+                             Error **errp)
 {
     VirtIOSerial *vser;
 
@@ -702,10 +704,7 @@ static int fetch_active_ports_list(QEMUFile *f, int version_id,
 
                 qemu_get_buffer(f, (unsigned char *)&port->elem,
                                 sizeof(port->elem));
-                virtqueue_map_sg(port->elem.in_sg, port->elem.in_addr,
-                                 port->elem.in_num, 1);
-                virtqueue_map_sg(port->elem.out_sg, port->elem.out_addr,
-                                 port->elem.out_num, 1);
+                virtqueue_map(&port->elem);
 
                 /*
                  *  Port was throttled on source machine.  Let's
@@ -973,7 +972,7 @@ static void virtio_serial_device_realize(DeviceState *dev, Error **errp)
     }
 
     /* Each port takes 2 queues, and one pair is for the control queue */
-    max_supported_ports = VIRTIO_PCI_QUEUE_MAX / 2 - 1;
+    max_supported_ports = VIRTIO_QUEUE_MAX / 2 - 1;
 
     if (vser->serial.max_virtserial_ports > max_supported_ports) {
         error_setg(errp, "maximum ports supported: %u", max_supported_ports);
@@ -1083,7 +1082,8 @@ static void virtio_serial_device_unrealize(DeviceState *dev, Error **errp)
 }
 
 static Property virtio_serial_properties[] = {
-    DEFINE_VIRTIO_SERIAL_PROPERTIES(VirtIOSerial, serial),
+    DEFINE_PROP_UINT32("max_ports", VirtIOSerial, serial.max_virtserial_ports,
+                                                  31),
     DEFINE_PROP_END_OF_LIST(),
 };
 

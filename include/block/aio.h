@@ -82,9 +82,6 @@ struct AioContext {
     /* Used for aio_notify.  */
     EventNotifier notifier;
 
-    /* GPollFDs for aio_poll() */
-    GArray *pollfds;
-
     /* Thread pool for performing work and receiving completion callbacks */
     struct ThreadPool *thread_pool;
 
@@ -227,6 +224,13 @@ bool aio_pending(AioContext *ctx);
  */
 bool aio_dispatch(AioContext *ctx);
 
+#define AIO_CLIENT_UNSPECIFIED    (1 << 0)
+#define AIO_CLIENT_PROTOCOL       (1 << 1)
+#define AIO_CLIENT_NBD_SERVER     (1 << 2)
+#define AIO_CLIENT_CONTEXT        (1 << 3)
+#define AIO_CLIENT_DATAPLANE      (1 << 4)
+#define AIO_CLIENT_MASK_ALL       -1
+
 /* Progress in completing AIO work to occur.  This can issue new pending
  * aio as a result of executing I/O completion or bh callbacks.
  *
@@ -234,13 +238,22 @@ bool aio_dispatch(AioContext *ctx);
  * handlers.  If @blocking == true, this should always be true except
  * if someone called aio_notify.
  *
+ * client_mask is a bit mask for AIO_CLIENT types, otherwise only the types
+ * corresponding to the set bits will be polled.
+ *
  * If there are no pending bottom halves, but there are pending AIO
  * operations, it may not be possible to make any progress without
  * blocking.  If @blocking is true, this function will wait until one
  * or more AIO events have completed, to ensure something has moved
  * before returning.
  */
-bool aio_poll(AioContext *ctx, bool blocking);
+bool aio_poll_clients(AioContext *ctx, bool blocking, int client_mask);
+
+/* Poll all types of clients. */
+static inline bool aio_poll(AioContext *ctx, bool blocking)
+{
+    return aio_poll_clients(ctx, blocking, AIO_CLIENT_MASK_ALL);
+}
 
 /* Register a file descriptor and associated callbacks.  Behaves very similarly
  * to qemu_set_fd_handler2.  Unlike qemu_set_fd_handler2, these callbacks will
@@ -251,6 +264,7 @@ bool aio_poll(AioContext *ctx, bool blocking);
  */
 void aio_set_fd_handler(AioContext *ctx,
                         int fd,
+                        int type,
                         IOHandler *io_read,
                         IOHandler *io_write,
                         void *opaque);
@@ -264,6 +278,7 @@ void aio_set_fd_handler(AioContext *ctx,
  */
 void aio_set_event_notifier(AioContext *ctx,
                             EventNotifier *notifier,
+                            int type,
                             EventNotifierHandler *io_read);
 
 /* Return a GSource that lets the main loop poll the file descriptors attached

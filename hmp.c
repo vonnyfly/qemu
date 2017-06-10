@@ -1034,7 +1034,7 @@ void hmp_drive_mirror(Monitor *mon, const QDict *qdict)
                      false, NULL, false, NULL,
                      full ? MIRROR_SYNC_MODE_FULL : MIRROR_SYNC_MODE_TOP,
                      true, mode, false, 0, false, 0, false, 0,
-                     false, 0, false, 0, &err);
+                     false, 0, false, 0, false, true, &err);
     hmp_handle_error(mon, &err);
 }
 
@@ -1652,6 +1652,16 @@ void hmp_screendump(Monitor *mon, const QDict *qdict)
     Error *err = NULL;
 
     qmp_screendump(filename, &err);
+    hmp_handle_error(mon, &err);
+}
+
+void hmp___com_redhat_qxl_screen_dump(Monitor *mon, const QDict *qdict)
+{
+    const char *id = qdict_get_str(qdict, "id");
+    const char *filename = qdict_get_str(qdict, "filename");
+    Error *err = NULL;
+
+    qmp___com_redhat_qxl_screendump(id, filename, &err);
     hmp_handle_error(mon, &err);
 }
 

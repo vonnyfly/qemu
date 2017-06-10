@@ -45,6 +45,7 @@
 #include "hw/usb.h"
 #include "hw/cpu/icc_bus.h"
 #include "qemu/error-report.h"
+#include "migration/migration.h"
 
 /* ICH9 AHCI has 6 ports */
 #define MAX_SATA_PORTS     6
@@ -72,7 +73,6 @@ static void pc_q35_init(MachineState *machine)
     PCIDevice *lpc;
     BusState *idebus[MAX_SATA_PORTS];
     ISADevice *rtc_state;
-    ISADevice *floppy;
     MemoryRegion *pci_memory;
     MemoryRegion *rom_memory;
     MemoryRegion *ram_memory;
@@ -89,6 +89,7 @@ static void pc_q35_init(MachineState *machine)
     PcGuestInfo *guest_info;
     ram_addr_t lowmem;
     DriveInfo *hd[MAX_SATA_PORTS];
+    MachineClass *mc = MACHINE_GET_CLASS(machine);
 
     /* Check whether RAM fits below 4G (leaving 1/2 GByte for IO memory
      * and 256 Mbytes for PCI Express Enhanced Configuration Access Mapping
@@ -163,10 +164,9 @@ static void pc_q35_init(MachineState *machine)
     guest_info->legacy_acpi_table_size = 0;
 
     if (smbios_defaults) {
-        MachineClass *mc = MACHINE_GET_CLASS(machine);
         /* These values are guest ABI, do not change */
-        smbios_set_defaults("QEMU", "Standard PC (Q35 + ICH9, 2009)",
-                            mc->name, smbios_legacy_mode, smbios_uuid_encoded);
+        smbios_set_defaults("Red Hat", "KVM",
+                            mc->desc, smbios_legacy_mode, smbios_uuid_encoded);
     }
 
     /* allocate ram and load rom/bios */
@@ -250,7 +250,7 @@ static void pc_q35_init(MachineState *machine)
     }
 
     /* init basic PC hardware */
-    pc_basic_device_init(isa_bus, gsi, &rtc_state, &floppy,
+    pc_basic_device_init(isa_bus, gsi, &rtc_state, !mc->no_floppy,
                          (pc_machine->vmport != ON_OFF_AUTO_ON), 0xff0104);
 
     /* connect pm stuff to lpc */
@@ -279,7 +279,7 @@ static void pc_q35_init(MachineState *machine)
                       8, NULL, 0);
 
     pc_cmos_init(below_4g_mem_size, above_4g_mem_size, machine->boot_order,
-                 machine, floppy, idebus[0], idebus[1], rtc_state);
+                 machine, idebus[0], idebus[1], rtc_state);
 
     /* the rest devices to which pci devfn is automatically assigned */
     pc_vga_init(isa_bus, host_bus);
@@ -289,6 +289,7 @@ static void pc_q35_init(MachineState *machine)
     }
 }
 
+#if 0 /* Disabled for Red Hat Enterprise Linux */
 static void pc_compat_2_2(MachineState *machine)
 {
     rsdp_in_ram = false;
@@ -517,3 +518,157 @@ static void pc_q35_machine_init(void)
 }
 
 machine_init(pc_q35_machine_init);
+
+#endif  /* Disabled for Red Hat Enterprise Linux */
+
+/* Red Hat Enterprise Linux machine types */
+
+static void pc_q35_compat_rhel720(MachineState *machine)
+{
+    /* KVM can't expose RDTSCP on AMD CPUs, so there's no point in enabling it
+     * on AMD CPU models.
+     */
+    x86_cpu_compat_set_features("phenom", FEAT_8000_0001_EDX, 0,
+                                CPUID_EXT2_RDTSCP);
+    x86_cpu_compat_set_features("Opteron_G2", FEAT_8000_0001_EDX, 0,
+                                CPUID_EXT2_RDTSCP);
+    x86_cpu_compat_set_features("Opteron_G3", FEAT_8000_0001_EDX, 0,
+                                CPUID_EXT2_RDTSCP);
+    x86_cpu_compat_set_features("Opteron_G4", FEAT_8000_0001_EDX, 0,
+                                CPUID_EXT2_RDTSCP);
+    x86_cpu_compat_set_features("Opteron_G5", FEAT_8000_0001_EDX, 0,
+                                CPUID_EXT2_RDTSCP);
+}
+
+static void pc_q35_init_rhel720(MachineState *machine)
+{
+    pc_q35_compat_rhel720(machine);
+    pc_q35_init(machine);
+}
+
+static QEMUMachine pc_q35_machine_rhel720 = {
+    PC_DEFAULT_MACHINE_OPTIONS,
+    .family = "pc_q35_Z",
+    .name = "pc-q35-rhel7.2.0",
+    .alias = "q35",
+    .desc = "RHEL-7.2.0 PC (Q35 + ICH9, 2009)",
+    .init = pc_q35_init_rhel720,
+    .default_machine_opts = "firmware=bios-256k.bin",
+    .default_display = "std",
+    .no_floppy = 1,
+    .compat_props = (GlobalProperty[]) {
+        { /* end of list */ }
+    },
+};
+
+static void pc_q35_compat_rhel710(MachineState *machine)
+{
+    PCMachineState *pcms = PC_MACHINE(machine);
+    PCMachineClass *pcmc = PC_MACHINE_GET_CLASS(pcms);
+
+    /* 7.1.0 is based on 2.1.2, 7.2.0 is based on 2.3 */
+    pc_q35_compat_rhel720(machine);
+
+    /* From pc_compat_2_2 */
+    rsdp_in_ram = false;
+    x86_cpu_compat_set_features("kvm64", FEAT_1_EDX, 0, CPUID_VME);
+    x86_cpu_compat_set_features("kvm32", FEAT_1_EDX, 0, CPUID_VME);
+    x86_cpu_compat_set_features("Conroe", FEAT_1_EDX, 0, CPUID_VME);
+    x86_cpu_compat_set_features("Penryn", FEAT_1_EDX, 0, CPUID_VME);
+    x86_cpu_compat_set_features("Nehalem", FEAT_1_EDX, 0, CPUID_VME);
+    x86_cpu_compat_set_features("Westmere", FEAT_1_EDX, 0, CPUID_VME);
+    x86_cpu_compat_set_features("SandyBridge", FEAT_1_EDX, 0, CPUID_VME);
+    x86_cpu_compat_set_features("Haswell", FEAT_1_EDX, 0, CPUID_VME);
+    x86_cpu_compat_set_features("Broadwell", FEAT_1_EDX, 0, CPUID_VME);
+    x86_cpu_compat_set_features("Opteron_G1", FEAT_1_EDX, 0, CPUID_VME);
+    x86_cpu_compat_set_features("Opteron_G2", FEAT_1_EDX, 0, CPUID_VME);
+    x86_cpu_compat_set_features("Opteron_G3", FEAT_1_EDX, 0, CPUID_VME);
+    x86_cpu_compat_set_features("Opteron_G4", FEAT_1_EDX, 0, CPUID_VME);
+    x86_cpu_compat_set_features("Opteron_G5", FEAT_1_EDX, 0, CPUID_VME);
+    x86_cpu_compat_set_features("Haswell", FEAT_1_ECX, 0, CPUID_EXT_F16C);
+    x86_cpu_compat_set_features("Haswell", FEAT_1_ECX, 0, CPUID_EXT_RDRAND);
+    x86_cpu_compat_set_features("Broadwell", FEAT_1_ECX, 0, CPUID_EXT_F16C);
+    x86_cpu_compat_set_features("Broadwell", FEAT_1_ECX, 0, CPUID_EXT_RDRAND);
+    machine->suppress_vmdesc = true;
+
+    /* From pc_compat_2_1 */
+    pcms->enforce_aligned_dimm = false;
+    smbios_uuid_encoded = false;
+    x86_cpu_compat_set_features("coreduo", FEAT_1_ECX, CPUID_EXT_VMX, 0);
+    x86_cpu_compat_set_features("core2duo", FEAT_1_ECX, CPUID_EXT_VMX, 0);
+    x86_cpu_compat_kvm_no_autodisable(FEAT_8000_0001_ECX, CPUID_EXT3_SVM);
+
+    /* From pc_q35_2_4_machine_options */
+    pcmc->broken_reserved_end = true;
+}
+
+static void pc_q35_init_rhel710(MachineState *machine)
+{
+    pc_q35_compat_rhel710(machine);
+    pc_q35_init(machine);
+}
+
+static QEMUMachine pc_q35_machine_rhel710 = {
+    PC_DEFAULT_MACHINE_OPTIONS,
+    .family = "pc_q35_Z",
+    .name = "pc-q35-rhel7.1.0",
+    .desc = "RHEL-7.1.0 PC (Q35 + ICH9, 2009)",
+    .init = pc_q35_init_rhel710,
+    .default_machine_opts = "firmware=bios-256k.bin",
+    .compat_props = (GlobalProperty[]) {
+        HW_COMPAT_RHEL7_1,
+        { /* end of list */ }
+    },
+};
+
+static void pc_q35_compat_rhel700(MachineState *machine)
+{
+    pc_q35_compat_rhel710(machine);
+
+    /* Upstream enables it for everyone, we're a little more selective */
+    x86_cpu_compat_kvm_no_autoenable(FEAT_1_ECX, CPUID_EXT_X2APIC);
+
+    x86_cpu_compat_set_features("Conroe", FEAT_1_ECX, CPUID_EXT_X2APIC, 0);
+    x86_cpu_compat_set_features("Penryn", FEAT_1_ECX, CPUID_EXT_X2APIC, 0);
+    x86_cpu_compat_set_features("Nehalem", FEAT_1_ECX, CPUID_EXT_X2APIC, 0);
+    x86_cpu_compat_set_features("Westmere", FEAT_1_ECX, CPUID_EXT_X2APIC, 0);
+    /* SandyBridge and Haswell already have x2apic enabled */
+    x86_cpu_compat_set_features("Opteron_G1", FEAT_1_ECX, CPUID_EXT_X2APIC, 0);
+    x86_cpu_compat_set_features("Opteron_G2", FEAT_1_ECX, CPUID_EXT_X2APIC, 0);
+    x86_cpu_compat_set_features("Opteron_G3", FEAT_1_ECX, CPUID_EXT_X2APIC, 0);
+    x86_cpu_compat_set_features("Opteron_G4", FEAT_1_ECX, CPUID_EXT_X2APIC, 0);
+    x86_cpu_compat_set_features("Opteron_G5", FEAT_1_ECX, CPUID_EXT_X2APIC, 0);
+
+    smbios_legacy_mode = true;
+    has_reserved_memory = false;
+    migrate_cve_2014_5263_xhci_fields = true;
+    global_state_set_optional();
+}
+
+static void pc_q35_init_rhel700(MachineState *machine)
+{
+    pc_q35_compat_rhel700(machine);
+    pc_q35_init(machine);
+}
+
+static QEMUMachine pc_q35_machine_rhel700 = {
+    PC_DEFAULT_MACHINE_OPTIONS,
+    .family = "pc_q35_Z",
+    .name = "pc-q35-rhel7.0.0",
+    .desc = "RHEL-7.0.0 PC (Q35 + ICH9, 2009)",
+    .init = pc_q35_init_rhel700,
+    .default_machine_opts = "firmware=bios-256k.bin",
+    .compat_props = (GlobalProperty[]) {
+        PC_RHEL7_0_COMPAT,
+        { /* end of list */ }
+    },
+};
+
+static void rhel_pc_q35_machine_init(void)
+{
+    qemu_register_pc_machine(&pc_q35_machine_rhel720);
+    qemu_register_pc_machine(&pc_q35_machine_rhel710);
+    qemu_register_pc_machine(&pc_q35_machine_rhel700);
+}
+
+machine_init(rhel_pc_q35_machine_init);

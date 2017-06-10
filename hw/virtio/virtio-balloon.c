@@ -70,7 +70,7 @@ static inline void reset_stats(VirtIOBalloon *dev)
 static bool balloon_stats_supported(const VirtIOBalloon *s)
 {
     VirtIODevice *vdev = VIRTIO_DEVICE(s);
-    return virtio_has_feature(vdev, VIRTIO_BALLOON_F_STATS_VQ);
+    return virtio_vdev_has_feature(vdev, VIRTIO_BALLOON_F_STATS_VQ);
 }
 
 static bool balloon_stats_enabled(const VirtIOBalloon *s)
@@ -310,9 +310,10 @@ static void virtio_balloon_set_config(VirtIODevice *vdev,
     trace_virtio_balloon_set_config(dev->actual, oldactual);
 }
 
-static uint32_t virtio_balloon_get_features(VirtIODevice *vdev, uint32_t f)
+static uint64_t virtio_balloon_get_features(VirtIODevice *vdev, uint64_t f,
+                                            Error **errp)
 {
-    f |= (1 << VIRTIO_BALLOON_F_STATS_VQ);
+    virtio_add_feature(&f, VIRTIO_BALLOON_F_STATS_VQ);
     return f;
 }
 
@@ -383,7 +384,7 @@ static void virtio_balloon_device_realize(DeviceState *dev, Error **errp)
                                    virtio_balloon_stat, s);
 
     if (ret < 0) {
-        error_setg(errp, "Adding balloon handler failed");
+        error_setg(errp, "Only one balloon device is supported");
         virtio_cleanup(vdev);
         return;
     }

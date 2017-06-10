@@ -60,6 +60,7 @@ typedef struct IscsiLun {
     uint8_t lbpme;
     uint8_t lbprz;
     uint8_t has_write_same;
+    uint8_t request_timed_out;
     struct scsi_inquiry_logical_block_provisioning lbp;
     struct scsi_inquiry_block_limits bl;
     unsigned char *zeroblock;
@@ -79,6 +80,7 @@ typedef struct IscsiTask {
     QEMUBH *bh;
     IscsiLun *iscsilun;
     QEMUTimer retry_timer;
+    int err_code;
 } IscsiTask;
 
 typedef struct IscsiAIOCB {
@@ -96,11 +98,11 @@ typedef struct IscsiAIOCB {
 #endif
 } IscsiAIOCB;
 
-#define EVENT_INTERVAL 250
+#define EVENT_INTERVAL 1000
 #define NOP_INTERVAL 5000
 #define MAX_NOP_FAILURES 3
 #define ISCSI_CMD_RETRIES ARRAY_SIZE(iscsi_retry_times)
-static const unsigned iscsi_retry_times[] = {8, 32, 128, 512, 2048};
+static const unsigned iscsi_retry_times[] = {8, 32, 128, 512, 2048, 8192, 32768};
 
 /* this threshold is a trade-off knob to choose between
  * the potential additional overhead of an extra GET_LBA_STATUS request
@@ -163,6 +165,51 @@ static inline unsigned exp_random(double mean)
     return -mean * log((double)rand() / RAND_MAX);
 }
 
+static int iscsi_translate_sense(struct scsi_sense *sense)
+{
+    int ret;
+
+    switch (sense->key) {
+    case SCSI_SENSE_NOT_READY:
+        return -EBUSY;
+    case SCSI_SENSE_DATA_PROTECTION:
+        return -EACCES;
+    case SCSI_SENSE_COMMAND_ABORTED:
+        return -ECANCELED;
+    case SCSI_SENSE_ILLEGAL_REQUEST:
+        /* Parse ASCQ */
+        break;
+    default:
+        return -EIO;
+    }
+    switch (sense->ascq) {
+    case SCSI_SENSE_ASCQ_PARAMETER_LIST_LENGTH_ERROR:
+    case SCSI_SENSE_ASCQ_INVALID_OPERATION_CODE:
+    case SCSI_SENSE_ASCQ_INVALID_FIELD_IN_CDB:
+    case SCSI_SENSE_ASCQ_INVALID_FIELD_IN_PARAMETER_LIST:
+        ret = -EINVAL;
+        break;
+    case SCSI_SENSE_ASCQ_LBA_OUT_OF_RANGE:
+        ret = -ENOSPC;
+        break;
+    case SCSI_SENSE_ASCQ_LOGICAL_UNIT_NOT_SUPPORTED:
+        ret = -ENOTSUP;
+        break;
+    case SCSI_SENSE_ASCQ_MEDIUM_NOT_PRESENT:
+    case SCSI_SENSE_ASCQ_MEDIUM_NOT_PRESENT_TRAY_CLOSED:
+    case SCSI_SENSE_ASCQ_MEDIUM_NOT_PRESENT_TRAY_OPEN:
+        ret = -ENOMEDIUM;
+        break;
+    case SCSI_SENSE_ASCQ_WRITE_PROTECTED:
+        ret = -EACCES;
+        break;
+    default:
+        ret = -EIO;
+        break;
+    }
+    return ret;
+}
+
 static void
 iscsi_co_generic_cb(struct iscsi_context *iscsi, int status,
                         void *command_data, void *opaque)
@@ -183,10 +230,20 @@ iscsi_co_generic_cb(struct iscsi_context *iscsi, int status,
                 iTask->do_retry = 1;
                 goto out;
             }
-            if (status == SCSI_STATUS_BUSY) {
+            if (status == SCSI_STATUS_BUSY ||
+                status == SCSI_STATUS_TIMEOUT ||
+                status == SCSI_STATUS_TASK_SET_FULL) {
                 unsigned retry_time =
                     exp_random(iscsi_retry_times[iTask->retries - 1]);
-                error_report("iSCSI Busy (retry #%u in %u ms): %s",
+
+                if (status == SCSI_STATUS_TIMEOUT) {
+                    /* make sure the request is rescheduled AFTER the
+                     * reconnect is initiated */
+                    retry_time = EVENT_INTERVAL * 2;
+                    iTask->iscsilun->request_timed_out = true;
+                }
+                error_report("iSCSI Busy/TaskSetFull/TimeOut"
+                             " (retry #%u in %u ms): %s",
                              iTask->retries, retry_time,
                              iscsi_get_error(iscsi));
                 aio_timer_init(iTask->iscsilun->aio_context,
@@ -198,6 +255,7 @@ iscsi_co_generic_cb(struct iscsi_context *iscsi, int status,
                 return;
             }
         }
+        iTask->err_code = iscsi_translate_sense(&task->sense);
         error_report("iSCSI Failure: %s", iscsi_get_error(iscsi));
     }
 
@@ -261,8 +319,8 @@ iscsi_set_events(IscsiLun *iscsilun)
     int ev = iscsi_which_events(iscsi);
 
     if (ev != iscsilun->events) {
-        aio_set_fd_handler(iscsilun->aio_context,
-                           iscsi_get_fd(iscsi),
+        aio_set_fd_handler(iscsilun->aio_context, iscsi_get_fd(iscsi),
+                           AIO_CLIENT_PROTOCOL,
                            (ev & POLLIN) ? iscsi_process_read : NULL,
                            (ev & POLLOUT) ? iscsi_process_write : NULL,
                            iscsilun);
@@ -276,12 +334,6 @@ iscsi_set_events(IscsiLun *iscsilun)
         timer_mod(iscsilun->event_timer,
                   qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + EVENT_INTERVAL);
     }
-}
-
-static void iscsi_timed_set_events(void *opaque)
-{
-    IscsiLun *iscsilun = opaque;
-    iscsi_set_events(iscsilun);
 }
 
 static void
@@ -416,7 +468,7 @@ retry:
     }
 
     if (iTask.status != SCSI_STATUS_GOOD) {
-        return -EIO;
+        return iTask.err_code;
     }
 
     iscsi_allocationmap_set(iscsilun, sector_num, nb_sectors);
@@ -605,7 +657,7 @@ retry:
     }
 
     if (iTask.status != SCSI_STATUS_GOOD) {
-        return -EIO;
+        return iTask.err_code;
     }
 
     return 0;
@@ -613,40 +665,7 @@ retry:
 
 static int coroutine_fn iscsi_co_flush(BlockDriverState *bs)
 {
-    IscsiLun *iscsilun = bs->opaque;
-    struct IscsiTask iTask;
-
-    if (bs->sg) {
-        return 0;
-    }
-
-    iscsi_co_init_iscsitask(iscsilun, &iTask);
-
-retry:
-    if (iscsi_synchronizecache10_task(iscsilun->iscsi, iscsilun->lun, 0, 0, 0,
-                                      0, iscsi_co_generic_cb, &iTask) == NULL) {
-        return -ENOMEM;
-    }
-
-    while (!iTask.complete) {
-        iscsi_set_events(iscsilun);
-        qemu_coroutine_yield();
-    }
-
-    if (iTask.task != NULL) {
-        scsi_free_scsi_task(iTask.task);
-        iTask.task = NULL;
-    }
-
-    if (iTask.do_retry) {
-        iTask.complete = 0;
-        goto retry;
-    }
-
-    if (iTask.status != SCSI_STATUS_GOOD) {
-        return -EIO;
-    }
-
+    (void)bs;
     return 0;
 }
 
@@ -664,7 +683,7 @@ iscsi_aio_ioctl_cb(struct iscsi_context *iscsi, int status,
     if (status < 0) {
         error_report("Failed to ioctl(SG_IO) to iSCSI lun. %s",
                      iscsi_get_error(iscsi));
-        acb->status = -EIO;
+        acb->status = iscsi_translate_sense(&acb->task->sense);
     }
 
     acb->ioh->driver_status = 0;
@@ -705,6 +724,13 @@ static BlockAIOCB *iscsi_aio_ioctl(BlockDriverState *bs,
     acb->status      = -EINPROGRESS;
     acb->buf         = NULL;
     acb->ioh         = buf;
+
+    if (acb->ioh->cmd_len > SCSI_CDB_MAX_SIZE) {
+        error_report("iSCSI: ioctl error CDB exceeds max size (%d > %d)",
+                     acb->ioh->cmd_len, SCSI_CDB_MAX_SIZE);
+        qemu_aio_unref(acb);
+        return NULL;
+    }
 
     acb->task = malloc(sizeof(struct scsi_task));
     if (acb->task == NULL) {
@@ -793,7 +819,7 @@ static int iscsi_ioctl(BlockDriverState *bs, unsigned long int req, void *buf)
         iscsi_aio_ioctl(bs, req, buf, ioctl_cb, &status);
 
         while (status == -EINPROGRESS) {
-            aio_poll(iscsilun->aio_context, true);
+            bdrv_aio_poll(iscsilun->aio_context, true);
         }
 
         return 0;
@@ -866,7 +892,7 @@ retry:
     }
 
     if (iTask.status != SCSI_STATUS_GOOD) {
-        return -EIO;
+        return iTask.err_code;
     }
 
     iscsi_allocationmap_clear(iscsilun, sector_num, nb_sectors);
@@ -959,7 +985,7 @@ retry:
     }
 
     if (iTask.status != SCSI_STATUS_GOOD) {
-        return -EIO;
+        return iTask.err_code;
     }
 
     if (flags & BDRV_REQ_MAY_UNMAP) {
@@ -1080,16 +1106,35 @@ static char *parse_initiator_name(const char *target)
     return iscsi_name;
 }
 
+
+static void iscsi_timed_check_events(void *opaque)
+{
+    IscsiLun *iscsilun = opaque;
+
+    /* check for timed out requests */
+    iscsi_service(iscsilun->iscsi, 0);
+
+    if (iscsilun->request_timed_out) {
+        iscsilun->request_timed_out = false;
+        iscsi_reconnect(iscsilun->iscsi);
+    }
+
+    /* newer versions of libiscsi may return zero events. Ensure we are able
+     * to return to service once this situation changes. */
+    iscsi_set_events(iscsilun);
+
+    timer_mod(iscsilun->event_timer,
+              qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + EVENT_INTERVAL);
+}
+
 static void iscsi_nop_timed_event(void *opaque)
 {
     IscsiLun *iscsilun = opaque;
 
-    if (iscsi_get_nops_in_flight(iscsilun->iscsi) > MAX_NOP_FAILURES) {
+    if (iscsi_get_nops_in_flight(iscsilun->iscsi) >= MAX_NOP_FAILURES) {
         error_report("iSCSI: NOP timeout. Reconnecting...");
-        iscsi_reconnect(iscsilun->iscsi);
-    }
-
-    if (iscsi_nop_out_async(iscsilun->iscsi, NULL, NULL, 0, NULL) != 0) {
+        iscsilun->request_timed_out = true;
+    } else if (iscsi_nop_out_async(iscsilun->iscsi, NULL, NULL, 0, NULL) != 0) {
         error_report("iSCSI: failed to sent NOP-Out. Disabling NOP messages.");
         return;
     }
@@ -1215,9 +1260,8 @@ static void iscsi_detach_aio_context(BlockDriverState *bs)
 {
     IscsiLun *iscsilun = bs->opaque;
 
-    aio_set_fd_handler(iscsilun->aio_context,
-                       iscsi_get_fd(iscsilun->iscsi),
-                       NULL, NULL, NULL);
+    aio_set_fd_handler(iscsilun->aio_context, iscsi_get_fd(iscsilun->iscsi),
+                       AIO_CLIENT_PROTOCOL, NULL, NULL, NULL);
     iscsilun->events = 0;
 
     if (iscsilun->nop_timer) {
@@ -1250,7 +1294,10 @@ static void iscsi_attach_aio_context(BlockDriverState *bs,
     /* Prepare a timer for a delayed call to iscsi_set_events */
     iscsilun->event_timer = aio_timer_new(iscsilun->aio_context,
                                           QEMU_CLOCK_REALTIME, SCALE_MS,
-                                          iscsi_timed_set_events, iscsilun);
+                                          iscsi_timed_check_events, iscsilun);
+
+    timer_mod(iscsilun->event_timer,
+              qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + EVENT_INTERVAL);
 }
 
 static bool iscsi_is_write_protected(IscsiLun *iscsilun)

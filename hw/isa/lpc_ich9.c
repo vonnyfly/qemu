@@ -494,7 +494,7 @@ static void ich9_lpc_machine_ready(Notifier *n, void *opaque)
         /* lpt */
         pci_conf[0x82] |= 0x04;
     }
-    if (memory_region_present(io_as, 0x3f0)) {
+    if (memory_region_present(io_as, 0x3f2)) {
         /* floppy */
         pci_conf[0x82] |= 0x08;
     }
@@ -634,6 +634,7 @@ static const VMStateDescription vmstate_ich9_rst_cnt = {
     .name = "ICH9LPC/rst_cnt",
     .version_id = 1,
     .minimum_version_id = 1,
+    .needed = ich9_rst_cnt_needed,
     .fields = (VMStateField[]) {
         VMSTATE_UINT8(rst_cnt, ICH9LPCState),
         VMSTATE_END_OF_LIST()
@@ -653,12 +654,9 @@ static const VMStateDescription vmstate_ich9_lpc = {
         VMSTATE_UINT32(sci_level, ICH9LPCState),
         VMSTATE_END_OF_LIST()
     },
-    .subsections = (VMStateSubsection[]) {
-        {
-            .vmsd = &vmstate_ich9_rst_cnt,
-            .needed = ich9_rst_cnt_needed
-        },
-        { 0 }
+    .subsections = (const VMStateDescription*[]) {
+        &vmstate_ich9_rst_cnt,
+        NULL
     }
 };
 

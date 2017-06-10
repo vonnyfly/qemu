@@ -106,6 +106,89 @@ Example:
 Note: The "force" argument defaults to false.
 
 EQMP
+    {
+        .name       = RFQDN_REDHAT "drive_add",
+        .args_type  = "simple-drive:O",
+        .params     = "id=name,[file=file][,format=f][,media=d]...",
+        .help       = "Create a drive similar to -device if=none.",
+	.user_print = monitor_user_noop,
+        .mhandler.cmd_new = simple_drive_add,
+    },
+
+SQMP
+__com.redhat_drive_add
+----------------------
+
+Create a drive similar to -device if=none.
+
+Arguments:
+
+- "id": Drive ID, must be unique (json-string)
+- "file": Disk image (json-string, optional)
+- "format": Disk format (json-string, optional)
+- "aio": How to perform asynchronous disk I/O (json-string, optional)
+- "cache": Host cache use policy (json-string, optional)
+- "cyls", "heads", "secs": Disk geometry (json-int, optional)
+- "trans": BIOS translation mode (json-string, optional)
+- "media": Media type (json-string, optional)
+- "readonly": Open image read-only (json-bool, optional)
+- "rerror": What to do on read error (json-string, optional)
+- "werror": What to do on write error (json-string, optional)
+- "serial": Drive serial number (json-string, optional)
+- "snapshot": Enable snapshot mode (json-bool, optional)
+- "copy-on-read": Enable copy-on-read mode (json-bool, optional)
+- "bps": total throughput limit in bytes per second is specified
+- "bps_rd": read throughput limit in bytes per second is specified
+- "bps_wr": write throughput limit in bytes per second is specified
+- "iops": total I/O operations per second is specified
+- "iops_rd": read I/O operations per second is specified
+- "iops_wr": write I/O operations per second is specified
+
+Example:
+
+1. Add a drive without medium:
+
+-> { "execute": "__com.redhat_drive_add", "arguments": { "id": "foo" } }
+<- {"return": {}}
+
+2. Add a drive with medium:
+
+-> { "execute": "__com.redhat_drive_add",
+     "arguments": { "id": "bar", "file": "tmp.qcow2", "format": "qcow2" } }
+<- {"return": {}}
+
+EQMP
+
+    {
+        .name       = RFQDN_REDHAT "drive_del",
+        .args_type  = "id:s",
+        .params     = "device",
+        .help       = "remove host block device",
+        .user_print = monitor_user_noop,
+        .mhandler.cmd_new = hmp_drive_del,
+    },
+
+SQMP
+__com.redhat_drive_del
+----------
+
+Remove host block device.  The result is that guest generated IO is no longer
+submitted against the host device underlying the disk.  Once a drive has
+been deleted, the QEMU Block layer returns -EIO which results in IO
+errors in the guest for applications that are reading/writing to the device.
+These errors are always reported to the guest, regardless of the drive's error
+actions (drive options rerror, werror).
+
+Arguments:
+
+- "id": the device's ID (json-string)
+
+Example:
+
+-> { "execute": "__com.redhat_drive_del", "arguments": { "id": "block1" } }
+<- { "return": {} }
+
+EQMP
 
     {
         .name       = "change",
@@ -163,6 +246,20 @@ Example:
 
 -> { "execute": "screendump", "arguments": { "filename": "/tmp/image" } }
 <- { "return": {} }
+
+EQMP
+
+    {
+        .name       = "__com.redhat_qxl_screendump",
+        .args_type  = "id:s,filename:F",
+        .mhandler.cmd_new = qmp_marshal_input___com_redhat_qxl_screendump,
+    },
+
+SQMP
+__com.redhat_qxl_screendump
+---------------------------
+
+Save screen from qxl device @var{id} into PPM image @var{filename}.
 
 EQMP
 
@@ -1380,6 +1477,7 @@ EQMP
         .args_type  = "sync:s,device:B,target:s,speed:i?,mode:s?,format:s?,"
                       "node-name:s?,replaces:s?,"
                       "on-source-error:s?,on-target-error:s?,"
+                      "unmap:b?,"
                       "granularity:i?,buf-size:i?",
         .mhandler.cmd_new = qmp_marshal_input_drive_mirror,
     },
@@ -1419,6 +1517,8 @@ Arguments:
   (BlockdevOnError, default 'report')
 - "on-target-error": the action to take on an error on the target
   (BlockdevOnError, default 'report')
+- "unmap": whether the target sectors should be discarded where source has only
+  zeroes. (json-bool, optional, default true)
 
 The default value of the granularity is the image cluster size clamped
 between 4096 and 65536, if the image format defines one.  If the format
@@ -3276,6 +3376,7 @@ Enable/Disable migration capabilities
 - "rdma-pin-all": pin all pages when using RDMA during migration
 - "auto-converge": throttle down guest to help convergence of migration
 - "zero-blocks": compress zero blocks during block migration
+- "events": generate events for each migration state change
 
 Arguments:
 

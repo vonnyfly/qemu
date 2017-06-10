@@ -67,7 +67,7 @@ static int virtio_ccw_hcall_notify(const uint64_t *args)
     if (!sch || !css_subch_visible(sch)) {
         return -EINVAL;
     }
-    if (queue >= VIRTIO_PCI_QUEUE_MAX) {
+    if (queue >= VIRTIO_CCW_QUEUE_MAX) {
         return -EINVAL;
     }
     virtio_queue_notify(virtio_ccw_get_vdev(sch), queue);
@@ -160,7 +160,7 @@ static void ccw_init(MachineState *machine)
     virtio_ccw_register_hcalls();
 
     /* allocate RAM for core */
-    memory_region_init_ram(ram, NULL, "s390.ram", my_ram_size, &error_abort);
+    memory_region_init_ram(ram, NULL, "s390.ram", my_ram_size, &error_fatal);
     vmstate_register_ram_global(ram);
     memory_region_add_subregion(sysmem, 0, ram);
 

@@ -833,6 +833,11 @@ static int64_t alloc_clusters_noref(BlockDriverState *bs, uint64_t size)
     uint64_t i, nb_clusters, refcount;
     int ret;
 
+    /* We can't allocate clusters if they may still be queued for discard. */
+    if (s->cache_discards) {
+        qcow2_process_discards(bs, 0);
+    }
+
     nb_clusters = size_to_clusters(s, size);
 retry:
     for(i = 0; i < nb_clusters; i++) {
@@ -884,8 +889,8 @@ int64_t qcow2_alloc_clusters(BlockDriverState *bs, uint64_t size)
     return offset;
 }
 
-int qcow2_alloc_clusters_at(BlockDriverState *bs, uint64_t offset,
-    int nb_clusters)
+int64_t qcow2_alloc_clusters_at(BlockDriverState *bs, uint64_t offset,
+                                int64_t nb_clusters)
 {
     BDRVQcowState *s = bs->opaque;
     uint64_t cluster_index, refcount;
@@ -949,19 +954,21 @@ int64_t qcow2_alloc_bytes(BlockDriverState *bs, int size)
     }
 
     free_in_cluster = s->cluster_size - offset_into_cluster(s, offset);
-    if (!offset || free_in_cluster < size) {
-        int64_t new_cluster = alloc_clusters_noref(bs, s->cluster_size);
-        if (new_cluster < 0) {
-            return new_cluster;
+    do {
+        if (!offset || free_in_cluster < size) {
+            int64_t new_cluster = alloc_clusters_noref(bs, s->cluster_size);
+            if (new_cluster < 0) {
+                return new_cluster;
+            }
+
+            if (!offset || ROUND_UP(offset, s->cluster_size) != new_cluster) {
+                offset = new_cluster;
+            }
         }
 
-        if (!offset || ROUND_UP(offset, s->cluster_size) != new_cluster) {
-            offset = new_cluster;
-        }
-    }
-
-    assert(offset);
-    ret = update_refcount(bs, offset, size, 1, false, QCOW2_DISCARD_NEVER);
+        assert(offset);
+        ret = update_refcount(bs, offset, size, 1, false, QCOW2_DISCARD_NEVER);
+    } while (ret == -EAGAIN);
     if (ret < 0) {
         return ret;
     }
@@ -1269,7 +1276,7 @@ static size_t refcount_array_byte_size(BDRVQcowState *s, uint64_t entries)
 static int realloc_refcount_array(BDRVQcowState *s, void **array,
                                   int64_t *size, int64_t new_size)
 {
-    size_t old_byte_size, new_byte_size;
+    int64_t old_byte_size, new_byte_size;
     void *new_ptr;
 
     /* Round to clusters so the array can be directly written to disk */
@@ -1285,13 +1292,17 @@ static int realloc_refcount_array(BDRVQcowState *s, void **array,
 
     assert(new_byte_size > 0);
 
+    if (new_byte_size > SIZE_MAX) {
+        return -ENOMEM;
+    }
+
     new_ptr = g_try_realloc(*array, new_byte_size);
     if (!new_ptr) {
         return -ENOMEM;
     }
 
     if (new_byte_size > old_byte_size) {
-        memset((void *)((uintptr_t)new_ptr + old_byte_size), 0,
+        memset((char *)new_ptr + old_byte_size, 0,
                new_byte_size - old_byte_size);
     }
 

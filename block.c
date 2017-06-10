@@ -99,8 +99,6 @@ static QLIST_HEAD(, BlockDriver) bdrv_drivers =
 
 static void bdrv_set_dirty(BlockDriverState *bs, int64_t cur_sector,
                            int nr_sectors);
-static void bdrv_reset_dirty(BlockDriverState *bs, int64_t cur_sector,
-                             int nr_sectors);
 /* If non-zero, use only whitelisted block drivers */
 static int use_bdrv_whitelist;
 
@@ -484,7 +482,7 @@ int bdrv_create(BlockDriver *drv, const char* filename,
         co = qemu_coroutine_create(bdrv_create_co_entry);
         qemu_coroutine_enter(co, &cco);
         while (cco.ret == NOT_DONE) {
-            aio_poll(qemu_get_aio_context(), true);
+            bdrv_aio_poll(qemu_get_aio_context(), true);
         }
     }
 
@@ -1994,7 +1992,7 @@ static bool bdrv_drain_one(BlockDriverState *bs)
     bdrv_flush_io_queue(bs);
     bdrv_start_throttled_reqs(bs);
     bs_busy = bdrv_requests_pending(bs);
-    bs_busy |= aio_poll(bdrv_get_aio_context(bs), bs_busy);
+    bs_busy |= bdrv_aio_poll(bdrv_get_aio_context(bs), bs_busy);
     return bs_busy;
 }
 
@@ -2033,6 +2031,16 @@ void bdrv_drain_all(void)
     bool busy = true;
     BlockDriverState *bs;
 
+    QTAILQ_FOREACH(bs, &bdrv_states, device_list) {
+        AioContext *aio_context = bdrv_get_aio_context(bs);
+
+        aio_context_acquire(aio_context);
+        if (bs->job) {
+            block_job_pause(bs->job);
+        }
+        aio_context_release(aio_context);
+    }
+
     while (busy) {
         busy = false;
 
@@ -2043,6 +2051,16 @@ void bdrv_drain_all(void)
             busy |= bdrv_drain_one(bs);
             aio_context_release(aio_context);
         }
+    }
+
+    QTAILQ_FOREACH(bs, &bdrv_states, device_list) {
+        AioContext *aio_context = bdrv_get_aio_context(bs);
+
+        aio_context_acquire(aio_context);
+        if (bs->job) {
+            block_job_resume(bs->job);
+        }
+        aio_context_release(aio_context);
     }
 }
 
@@ -2772,7 +2790,7 @@ static int bdrv_prwv_co(BlockDriverState *bs, int64_t offset,
         co = qemu_coroutine_create(bdrv_rw_co_entry);
         qemu_coroutine_enter(co, &rwco);
         while (rwco.ret == NOT_DONE) {
-            aio_poll(aio_context, true);
+            bdrv_aio_poll(aio_context, true);
         }
     }
     return rwco.ret;
@@ -3375,6 +3393,94 @@ static int coroutine_fn bdrv_aligned_pwritev(BlockDriverState *bs,
     return ret;
 }
 
+static int coroutine_fn bdrv_co_do_zero_pwritev(BlockDriverState *bs,
+                                                int64_t offset,
+                                                unsigned int bytes,
+                                                BdrvRequestFlags flags,
+                                                BdrvTrackedRequest *req)
+{
+    uint8_t *buf = NULL;
+    QEMUIOVector local_qiov;
+    struct iovec iov;
+    uint64_t align = MAX(BDRV_SECTOR_SIZE, bs->request_alignment);
+    unsigned int head_padding_bytes, tail_padding_bytes;
+    int ret = 0;
+
+    head_padding_bytes = offset & (align - 1);
+    tail_padding_bytes = align - ((offset + bytes) & (align - 1));
+
+
+    assert(flags & BDRV_REQ_ZERO_WRITE);
+    if (head_padding_bytes || tail_padding_bytes) {
+        buf = qemu_blockalign(bs, align);
+        iov = (struct iovec) {
+            .iov_base   = buf,
+            .iov_len    = align,
+        };
+        qemu_iovec_init_external(&local_qiov, &iov, 1);
+    }
+    if (head_padding_bytes) {
+        uint64_t zero_bytes = MIN(bytes, align - head_padding_bytes);
+
+        /* RMW the unaligned part before head. */
+        mark_request_serialising(req, align);
+        wait_serialising_requests(req);
+        BLKDBG_EVENT(bs, BLKDBG_PWRITEV_RMW_HEAD);
+        ret = bdrv_aligned_preadv(bs, req, offset & ~(align - 1), align,
+                                  align, &local_qiov, 0);
+        if (ret < 0) {
+            goto fail;
+        }
+        BLKDBG_EVENT(bs, BLKDBG_PWRITEV_RMW_AFTER_HEAD);
+
+        memset(buf + head_padding_bytes, 0, zero_bytes);
+        ret = bdrv_aligned_pwritev(bs, req, offset & ~(align - 1), align,
+                                   &local_qiov,
+                                   flags & ~BDRV_REQ_ZERO_WRITE);
+        if (ret < 0) {
+            goto fail;
+        }
+        offset += zero_bytes;
+        bytes -= zero_bytes;
+    }
+
+    assert(!bytes || (offset & (align - 1)) == 0);
+    if (bytes >= align) {
+        /* Write the aligned part in the middle. */
+        uint64_t aligned_bytes = bytes & ~(align - 1);
+        ret = bdrv_aligned_pwritev(bs, req, offset, aligned_bytes,
+                                   NULL, flags);
+        if (ret < 0) {
+            goto fail;
+        }
+        bytes -= aligned_bytes;
+        offset += aligned_bytes;
+    }
+
+    assert(!bytes || (offset & (align - 1)) == 0);
+    if (bytes) {
+        assert(align == tail_padding_bytes + bytes);
+        /* RMW the unaligned part after tail. */
+        mark_request_serialising(req, align);
+        wait_serialising_requests(req);
+        BLKDBG_EVENT(bs, BLKDBG_PWRITEV_RMW_TAIL);
+        ret = bdrv_aligned_preadv(bs, req, offset, align,
+                                  align, &local_qiov, 0);
+        if (ret < 0) {
+            goto fail;
+        }
+        BLKDBG_EVENT(bs, BLKDBG_PWRITEV_RMW_AFTER_TAIL);
+
+        memset(buf, 0, bytes);
+        ret = bdrv_aligned_pwritev(bs, req, offset, align,
+                                   &local_qiov, flags & ~BDRV_REQ_ZERO_WRITE);
+    }
+fail:
+    qemu_vfree(buf);
+    return ret;
+
+}
+
 /*
  * Handle a write request in coroutine context
  */
@@ -3413,6 +3519,11 @@ static int coroutine_fn bdrv_co_do_pwritev(BlockDriverState *bs,
      * only for bdrv_aligned_pwritev, but also for the reads of the RMW cycle.
      */
     tracked_request_begin(&req, bs, offset, bytes, true);
+
+    if (!qiov) {
+        ret = bdrv_co_do_zero_pwritev(bs, offset, bytes, flags, &req);
+        goto out;
+    }
 
     if (offset & (align - 1)) {
         QEMUIOVector head_qiov;
@@ -3491,14 +3602,14 @@ static int coroutine_fn bdrv_co_do_pwritev(BlockDriverState *bs,
                                flags);
 
 fail:
-    tracked_request_end(&req);
 
     if (use_local_qiov) {
         qemu_iovec_destroy(&local_qiov);
     }
     qemu_vfree(head_buf);
     qemu_vfree(tail_buf);
-
+out:
+    tracked_request_end(&req);
     return ret;
 }
 
@@ -3666,9 +3777,25 @@ BlockErrorAction bdrv_get_error_action(BlockDriverState *bs, bool is_read, int e
     }
 }
 
+/* https://bugzilla.redhat.com/show_bug.cgi?id=1199174 */
+static RHEL7BlockErrorReason get_rhel7_error_reason(int error)
+{
+	switch (error) {
+	case ENOSPC:
+        return RHEL7_BLOCK_ERROR_REASON_ENOSPC;
+	case EPERM:
+        return RHEL7_BLOCK_ERROR_REASON_EPERM;
+	case EIO:
+        return RHEL7_BLOCK_ERROR_REASON_EIO;
+	default:
+        return RHEL7_BLOCK_ERROR_REASON_EOTHER;
+    }
+}
+
 static void send_qmp_error_event(BlockDriverState *bs,
                                  BlockErrorAction action,
-                                 bool is_read, int error)
+                                 bool is_read, int error,
+                                 RHEL7BlockErrorReason res)
 {
     IoOperationType optype;
 
@@ -3676,7 +3803,7 @@ static void send_qmp_error_event(BlockDriverState *bs,
     qapi_event_send_block_io_error(bdrv_get_device_name(bs), optype, action,
                                    bdrv_iostatus_is_enabled(bs),
                                    error == ENOSPC, strerror(error),
-                                   &error_abort);
+                                   res, &error_abort);
 }
 
 /* This is done by device models because, while the block layer knows
@@ -3686,7 +3813,10 @@ static void send_qmp_error_event(BlockDriverState *bs,
 void bdrv_error_action(BlockDriverState *bs, BlockErrorAction action,
                        bool is_read, int error)
 {
+    RHEL7BlockErrorReason res;
+
     assert(error >= 0);
+    res = get_rhel7_error_reason(error);
 
     if (action == BLOCK_ERROR_ACTION_STOP) {
         /* First set the iostatus, so that "info block" returns an iostatus
@@ -3704,10 +3834,10 @@ void bdrv_error_action(BlockDriverState *bs, BlockErrorAction action,
          * also ensures that the STOP/RESUME pair of events is emitted.
          */
         qemu_system_vmstop_request_prepare();
-        send_qmp_error_event(bs, action, is_read, error);
+        send_qmp_error_event(bs, action, is_read, error, res);
         qemu_system_vmstop_request(RUN_STATE_IO_ERROR);
     } else {
-        send_qmp_error_event(bs, action, is_read, error);
+        send_qmp_error_event(bs, action, is_read, error, res);
     }
 }
 
@@ -4142,28 +4272,54 @@ static int64_t coroutine_fn bdrv_co_get_block_status(BlockDriverState *bs,
     return ret;
 }
 
-/* Coroutine wrapper for bdrv_get_block_status() */
-static void coroutine_fn bdrv_get_block_status_co_entry(void *opaque)
+static int64_t coroutine_fn bdrv_co_get_block_status_above(BlockDriverState *bs,
+        BlockDriverState *base,
+        int64_t sector_num,
+        int nb_sectors,
+        int *pnum)
+{
+    BlockDriverState *p;
+    int64_t ret = 0;
+
+    assert(bs != base);
+    for (p = bs; p != base; p = p->backing_hd) {
+        ret = bdrv_co_get_block_status(p, sector_num, nb_sectors, pnum);
+        if (ret < 0 || ret & BDRV_BLOCK_ALLOCATED) {
+            break;
+        }
+        /* [sector_num, pnum] unallocated on this layer, which could be only
+         * the first part of [sector_num, nb_sectors].  */
+        nb_sectors = MIN(nb_sectors, *pnum);
+    }
+    return ret;
+}
+
+/* Coroutine wrapper for bdrv_get_block_status_above() */
+static void coroutine_fn bdrv_get_block_status_above_co_entry(void *opaque)
 {
     BdrvCoGetBlockStatusData *data = opaque;
-    BlockDriverState *bs = data->bs;
 
-    data->ret = bdrv_co_get_block_status(bs, data->sector_num, data->nb_sectors,
-                                         data->pnum);
+    data->ret = bdrv_co_get_block_status_above(data->bs, data->base,
+                                               data->sector_num,
+                                               data->nb_sectors,
+                                               data->pnum);
     data->done = true;
 }
 
 /*
- * Synchronous wrapper around bdrv_co_get_block_status().
+ * Synchronous wrapper around bdrv_co_get_block_status_above().
  *
- * See bdrv_co_get_block_status() for details.
+ * See bdrv_co_get_block_status_above() for details.
  */
-int64_t bdrv_get_block_status(BlockDriverState *bs, int64_t sector_num,
-                              int nb_sectors, int *pnum)
+int64_t bdrv_get_block_status_above(BlockDriverState *bs,
+                                    BlockDriverState *base,
+                                    int64_t sector_num,
+                                    int nb_sectors, int *pnum)
 {
     Coroutine *co;
     BdrvCoGetBlockStatusData data = {
         .bs = bs,
+        .base = base,
         .sector_num = sector_num,
         .nb_sectors = nb_sectors,
         .pnum = pnum,
@@ -4172,17 +4328,25 @@ int64_t bdrv_get_block_status(BlockDriverState *bs, int64_t sector_num,
 
     if (qemu_in_coroutine()) {
         /* Fast-path if already in coroutine context */
-        bdrv_get_block_status_co_entry(&data);
+        bdrv_get_block_status_above_co_entry(&data);
     } else {
         AioContext *aio_context = bdrv_get_aio_context(bs);
 
-        co = qemu_coroutine_create(bdrv_get_block_status_co_entry);
+        co = qemu_coroutine_create(bdrv_get_block_status_above_co_entry);
         qemu_coroutine_enter(co, &data);
         while (!data.done) {
-            aio_poll(aio_context, true);
+            bdrv_aio_poll(aio_context, true);
         }
     }
     return data.ret;
+}
+
+int64_t bdrv_get_block_status(BlockDriverState *bs,
+                              int64_t sector_num,
+                              int nb_sectors, int *pnum)
+{
+    return bdrv_get_block_status_above(bs, bs->backing_hd,
+                                       sector_num, nb_sectors, pnum);
 }
 
 int coroutine_fn bdrv_is_allocated(BlockDriverState *bs, int64_t sector_num,
@@ -4721,9 +4885,9 @@ void bdrv_aio_cancel(BlockAIOCB *acb)
     bdrv_aio_cancel_async(acb);
     while (acb->refcnt > 1) {
         if (acb->aiocb_info->get_aio_context) {
-            aio_poll(acb->aiocb_info->get_aio_context(acb), true);
+            bdrv_aio_poll(acb->aiocb_info->get_aio_context(acb), true);
         } else if (acb->bs) {
-            aio_poll(bdrv_get_aio_context(acb->bs), true);
+            bdrv_aio_poll(bdrv_get_aio_context(acb->bs), true);
         } else {
             abort();
         }
@@ -5169,7 +5333,7 @@ int bdrv_flush(BlockDriverState *bs)
         co = qemu_coroutine_create(bdrv_flush_co_entry);
         qemu_coroutine_enter(co, &rwco);
         while (rwco.ret == NOT_DONE) {
-            aio_poll(aio_context, true);
+            bdrv_aio_poll(aio_context, true);
         }
     }
 
@@ -5205,8 +5369,6 @@ int coroutine_fn bdrv_co_discard(BlockDriverState *bs, int64_t sector_num,
         return -EROFS;
     }
 
-    bdrv_reset_dirty(bs, sector_num, nb_sectors);
-
     /* Do nothing if disabled.  */
     if (!(bs->open_flags & BDRV_O_UNMAP)) {
         return 0;
@@ -5215,6 +5377,8 @@ int coroutine_fn bdrv_co_discard(BlockDriverState *bs, int64_t sector_num,
     if (!bs->drv->bdrv_co_discard && !bs->drv->bdrv_aio_discard) {
         return 0;
     }
+
+    bdrv_set_dirty(bs, sector_num, nb_sectors);
 
     max_discard = MIN_NON_ZERO(bs->bl.max_discard, BDRV_REQUEST_MAX_SECTORS);
     while (nb_sectors > 0) {
@@ -5282,7 +5446,7 @@ int bdrv_discard(BlockDriverState *bs, int64_t sector_num, int nb_sectors)
         co = qemu_coroutine_create(bdrv_discard_co_entry);
         qemu_coroutine_enter(co, &rwco);
         while (rwco.ret == NOT_DONE) {
-            aio_poll(aio_context, true);
+            bdrv_aio_poll(aio_context, true);
         }
     }
 
@@ -5523,15 +5687,6 @@ static void bdrv_set_dirty(BlockDriverState *bs, int64_t cur_sector,
     BdrvDirtyBitmap *bitmap;
     QLIST_FOREACH(bitmap, &bs->dirty_bitmaps, list) {
         hbitmap_set(bitmap->bitmap, cur_sector, nr_sectors);
-    }
-}
-
-static void bdrv_reset_dirty(BlockDriverState *bs, int64_t cur_sector,
-                             int nr_sectors)
-{
-    BdrvDirtyBitmap *bitmap;
-    QLIST_FOREACH(bitmap, &bs->dirty_bitmaps, list) {
-        hbitmap_reset(bitmap->bitmap, cur_sector, nr_sectors);
     }
 }
 
@@ -6228,4 +6383,10 @@ void bdrv_refresh_filename(BlockDriverState *bs)
 BlockAcctStats *bdrv_get_stats(BlockDriverState *bs)
 {
     return &bs->stats;
+}
+
+bool bdrv_aio_poll(AioContext *ctx, bool blocking)
+{
+    return aio_poll_clients(ctx, blocking,
+                            AIO_CLIENT_PROTOCOL | AIO_CLIENT_CONTEXT);
 }

@@ -462,9 +462,7 @@ static void test_flush(void)
         tmp_path);
 
     /* Delay the completion of the flush request until we explicitly do it */
-    qmp_discard_response("{'execute':'human-monitor-command', 'arguments': {"
-                         " 'command-line':"
-                         " 'qemu-io ide0-hd0 \"break flush_to_os A\"'} }");
+    g_free(hmp("qemu-io ide0-hd0 \"break flush_to_os A\""));
 
     /* FLUSH CACHE command on device 0*/
     outb(IDE_BASE + reg_device, 0);
@@ -476,9 +474,7 @@ static void test_flush(void)
     assert_bit_clear(data, DF | ERR | DRQ);
 
     /* Complete the command */
-    qmp_discard_response("{'execute':'human-monitor-command', 'arguments': {"
-                         " 'command-line':"
-                         " 'qemu-io ide0-hd0 \"resume A\"'} }");
+    g_free(hmp("qemu-io ide0-hd0 \"resume A\""));
 
     /* Check registers */
     data = inb(IDE_BASE + reg_device);
@@ -520,7 +516,6 @@ static void test_retry_flush(const char *machine)
 {
     uint8_t data;
     const char *s;
-    QDict *response;
 
     prepare_blkdebug_script(debug_path, "flush_to_disk");
 
@@ -539,15 +534,7 @@ static void test_retry_flush(const char *machine)
     assert_bit_set(data, BSY | DRDY);
     assert_bit_clear(data, DF | ERR | DRQ);
 
-    for (;; response = NULL) {
-        response = qmp_receive();
-        if ((qdict_haskey(response, "event")) &&
-            (strcmp(qdict_get_str(response, "event"), "STOP") == 0)) {
-            QDECREF(response);
-            break;
-        }
-        QDECREF(response);
-    }
+    qmp_eventwait("STOP");
 
     /* Complete the command */
     s = "{'execute':'cont' }";

@@ -15,14 +15,12 @@
 #include "hw/pci/pci.h"
 #include "hw/boards.h"
 #include "hw/compat.h"
+#include "hw/mem/pc-dimm.h"
 
 #define HPET_INTCAP "hpet-intcap"
 
 /**
  * PCMachineState:
- * @hotplug_memory_base: address in guest RAM address space where hotplug memory
- * address space begins.
- * @hotplug_memory: hotplug memory addess space container
  * @acpi_dev: link to ACPI PM device that performs ACPI hotplug handling
  * @enforce_aligned_dimm: check that DIMM's address/size is aligned by
  *                        backend's alignment value if provided
@@ -32,8 +30,7 @@ struct PCMachineState {
     MachineState parent_obj;
 
     /* <public> */
-    ram_addr_t hotplug_memory_base;
-    MemoryRegion hotplug_memory;
+    MemoryHotplugState hotplug_memory;
 
     HotplugHandler *acpi_dev;
     ISADevice *rtc;
@@ -58,6 +55,7 @@ struct PCMachineClass {
     MachineClass parent_class;
 
     /*< public >*/
+    bool broken_reserved_end;
     HotplugHandler *(*get_hotplug_handler)(MachineState *machine,
                                            DeviceState *dev);
 };
@@ -199,13 +197,13 @@ qemu_irq *pc_allocate_cpu_irq(void);
 DeviceState *pc_vga_init(ISABus *isa_bus, PCIBus *pci_bus);
 void pc_basic_device_init(ISABus *isa_bus, qemu_irq *gsi,
                           ISADevice **rtc_state,
-                          ISADevice **floppy,
+                          bool create_fdctrl,
                           bool no_vmport,
                           uint32 hpet_irqs);
 void pc_init_ne2k_isa(ISABus *bus, NICInfo *nd);
 void pc_cmos_init(ram_addr_t ram_size, ram_addr_t above_4g_mem_size,
                   const char *boot_device, MachineState *machine,
-                  ISADevice *floppy, BusState *ide0, BusState *ide1,
+                  BusState *ide0, BusState *ide1,
                   ISADevice *s);
 void pc_nic_init(ISABus *isa_bus, PCIBus *pci_bus);
 void pc_pci_device_init(PCIBus *pci_bus);
@@ -219,8 +217,7 @@ void ioapic_init_gsi(GSIState *gsi_state, const char *parent_name);
 
 I2CBus *piix4_pm_init(PCIBus *bus, int devfn, uint32_t smb_io_base,
                       qemu_irq sci_irq, qemu_irq smi_irq,
-                      int kvm_enabled, FWCfgState *fw_cfg,
-                      DeviceState **piix4_pm);
+                      int kvm_enabled, DeviceState **piix4_pm);
 void piix4_smbus_register_device(SMBusDevice *dev, uint8_t addr);
 
 /* hpet.c */
@@ -512,6 +509,154 @@ bool e820_get_entry(int, uint32_t, uint64_t *, uint64_t *);
 #define PC_DEFAULT_MACHINE_OPTIONS \
     PC_COMMON_MACHINE_OPTIONS, \
     .hot_add_cpu = pc_hot_add_cpu, \
-    .max_cpus = 255
+    .max_cpus = 240
+
+/*
+ * The PC_RHEL_*_COMPAT serve the same purpose for RHEL-7 machine
+ * types as the PC_COMPAT_* do for upstream types.
+ * PC_RHEL_7_*_COMPAT apply both to i440fx and q35 types.
+ * PC_RHEL6_*_COMPAT apply to i440fx types only, and therefore live
+ * in pc_piix.c.
+ */
+
+/* See include/hw/compat.h for shared compatibility lists */
+#define PC_RHEL7_1_COMPAT \
+        HW_COMPAT_RHEL7_1, \
+        {\
+            .driver   = "qemu64" "-" TYPE_X86_CPU,\
+            .property = "level",\
+            .value    = stringify(4),\
+        },{\
+            .driver   = "kvm64" "-" TYPE_X86_CPU,\
+            .property = "level",\
+            .value    = stringify(5),\
+        },{\
+            .driver   = "pentium3" "-" TYPE_X86_CPU,\
+            .property = "level",\
+            .value    = stringify(2),\
+        },{\
+            .driver   = "n270" "-" TYPE_X86_CPU,\
+            .property = "level",\
+            .value    = stringify(5),\
+        },{\
+            .driver   = "Conroe" "-" TYPE_X86_CPU,\
+            .property = "level",\
+            .value    = stringify(4),\
+        },{\
+            .driver   = "Penryn" "-" TYPE_X86_CPU,\
+            .property = "level",\
+            .value    = stringify(4),\
+        },{\
+            .driver   = "Nehalem" "-" TYPE_X86_CPU,\
+            .property = "level",\
+            .value    = stringify(4),\
+        },{\
+            .driver   = "n270" "-" TYPE_X86_CPU,\
+            .property = "xlevel",\
+            .value    = stringify(0x8000000a),\
+        },{\
+            .driver   = "Penryn" "-" TYPE_X86_CPU,\
+            .property = "xlevel",\
+            .value    = stringify(0x8000000a),\
+        },{\
+            .driver   = "Conroe" "-" TYPE_X86_CPU,\
+            .property = "xlevel",\
+            .value    = stringify(0x8000000a),\
+        },{\
+            .driver   = "Nehalem" "-" TYPE_X86_CPU,\
+            .property = "xlevel",\
+            .value    = stringify(0x8000000a),\
+        },{\
+            .driver   = "Westmere" "-" TYPE_X86_CPU,\
+            .property = "xlevel",\
+            .value    = stringify(0x8000000a),\
+        },{\
+            .driver   = "SandyBridge" "-" TYPE_X86_CPU,\
+            .property = "xlevel",\
+            .value    = stringify(0x8000000a),\
+        },{\
+            .driver   = "IvyBridge" "-" TYPE_X86_CPU,\
+            .property = "xlevel",\
+            .value    = stringify(0x8000000a),\
+        },{\
+            .driver   = "Haswell" "-" TYPE_X86_CPU,\
+            .property = "xlevel",\
+            .value    = stringify(0x8000000a),\
+        },{\
+            .driver   = "Haswell-noTSX" "-" TYPE_X86_CPU,\
+            .property = "xlevel",\
+            .value    = stringify(0x8000000a),\
+        },{\
+            .driver   = "Broadwell" "-" TYPE_X86_CPU,\
+            .property = "xlevel",\
+            .value    = stringify(0x8000000a),\
+        },{\
+            .driver   = "Broadwell-noTSX" "-" TYPE_X86_CPU,\
+            .property = "xlevel",\
+            .value    = stringify(0x8000000a),\
+        }
+
+/*
+ * RHEL-7 is based on QEMU 1.5.3, so this needs the PC_COMPAT_*
+ * between our base and 1.5, less stuff backported to RHEL-7.0
+ * (usb-device.msos-desc), less stuff for devices we changed
+ * (qemu64-x86_64-cpu) or don't support (hpet, pci-serial-2x,
+ * pci-serial-4x) in 7.0.
+ */
+#define PC_RHEL7_0_COMPAT \
+        PC_RHEL7_1_COMPAT,\
+        {\
+            .driver   = "virtio-scsi-pci",\
+            .property = "any_layout",\
+            .value    = "off",\
+        },{\
+            .driver   = "PIIX4_PM",\
+            .property = "memory-hotplug-support",\
+            .value    = "off",\
+        },{\
+            .driver   = "apic",\
+            .property = "version",\
+            .value    = stringify(0x11),\
+        },{\
+            .driver   = "nec-usb-xhci",\
+            .property = "superspeed-ports-first",\
+            .value    = "off",\
+        },{\
+            .driver   = "nec-usb-xhci",\
+            .property = "force-pcie-endcap",\
+            .value    = "on",\
+        },{\
+            .driver   = "pci-serial",\
+            .property = "prog_if",\
+            .value    = stringify(0),\
+        },{\
+            .driver   = "virtio-net-pci",\
+            .property = "guest_announce",\
+            .value    = "off",\
+        },{\
+            .driver   = "ICH9-LPC",\
+            .property = "memory-hotplug-support",\
+            .value    = "off",\
+        },{\
+            .driver   = "xio3130-downstream",\
+            .property = COMPAT_PROP_PCP,\
+            .value    = "off",\
+        },{\
+            .driver   = "ioh3420",\
+            .property = COMPAT_PROP_PCP,\
+            .value    = "off",\
+        },{\
+            .driver   = "PIIX4_PM",\
+            .property = "acpi-pci-hotplug-with-bridge-support",\
+            .value    = "off",\
+        },{\
+            .driver   = "e1000",\
+            .property = "mitigation",\
+            .value    = "off",\
+        },{ \
+            .driver   = "virtio-net-pci", \
+            .property = "ctrl_guest_offloads", \
+            .value    = "off", \
+        }
 
 #endif

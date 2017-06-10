@@ -30,6 +30,7 @@
 #include "hw/block/fdc.h"
 #include "hw/ide.h"
 #include "hw/pci/pci.h"
+#include "hw/pci/pci_bus.h"
 #include "monitor/monitor.h"
 #include "hw/nvram/fw_cfg.h"
 #include "hw/timer/hpet.h"
@@ -63,7 +64,6 @@
 #include "hw/pci/pci_host.h"
 #include "acpi-build.h"
 #include "hw/mem/pc-dimm.h"
-#include "trace.h"
 #include "qapi/visitor.h"
 #include "qapi-visit.h"
 
@@ -314,10 +314,81 @@ static void pc_boot_set(void *opaque, const char *boot_device, Error **errp)
     set_boot_dev(opaque, boot_device, errp);
 }
 
+static void pc_cmos_init_floppy(ISADevice *rtc_state, ISADevice *floppy)
+{
+    int val, nb, i;
+    FDriveType fd_type[2] = { FDRIVE_DRV_NONE, FDRIVE_DRV_NONE };
+
+    /* floppy type */
+    if (floppy) {
+        for (i = 0; i < 2; i++) {
+            fd_type[i] = isa_fdc_get_drive_type(floppy, i);
+        }
+    }
+    val = (cmos_get_fd_drive_type(fd_type[0]) << 4) |
+        cmos_get_fd_drive_type(fd_type[1]);
+    rtc_set_memory(rtc_state, 0x10, val);
+
+    val = rtc_get_memory(rtc_state, REG_EQUIPMENT_BYTE);
+    nb = 0;
+    if (fd_type[0] < FDRIVE_DRV_NONE) {
+        nb++;
+    }
+    if (fd_type[1] < FDRIVE_DRV_NONE) {
+        nb++;
+    }
+    switch (nb) {
+    case 0:
+        break;
+    case 1:
+        val |= 0x01; /* 1 drive, ready for boot */
+        break;
+    case 2:
+        val |= 0x41; /* 2 drives, ready for boot */
+        break;
+    }
+    rtc_set_memory(rtc_state, REG_EQUIPMENT_BYTE, val);
+}
+
 typedef struct pc_cmos_init_late_arg {
     ISADevice *rtc_state;
     BusState *idebus[2];
 } pc_cmos_init_late_arg;
+
+typedef struct check_fdc_state {
+    ISADevice *floppy;
+    bool multiple;
+} CheckFdcState;
+
+static int check_fdc(Object *obj, void *opaque)
+{
+    CheckFdcState *state = opaque;
+    Object *fdc;
+    uint32_t iobase;
+    Error *local_err = NULL;
+
+    fdc = object_dynamic_cast(obj, TYPE_ISA_FDC);
+    if (!fdc) {
+        return 0;
+    }
+
+    iobase = object_property_get_int(obj, "iobase", &local_err);
+    if (local_err || iobase != 0x3f0) {
+        error_free(local_err);
+        return 0;
+    }
+
+    if (state->floppy) {
+        state->multiple = true;
+    } else {
+        state->floppy = ISA_DEVICE(obj);
+    }
+    return 0;
+}
+
+static const char * const fdc_container_path[] = {
+    "/unattached", "/peripheral", "/peripheral-anon"
+};
 
 static void pc_cmos_init_late(void *opaque)
 {
@@ -327,6 +398,8 @@ static void pc_cmos_init_late(void *opaque)
     int8_t heads, sectors;
     int val;
     int i, trans;
+    Object *container;
+    CheckFdcState state = { 0 };
 
     val = 0;
     if (ide_get_geometry(arg->idebus[0], 0,
@@ -356,16 +429,32 @@ static void pc_cmos_init_late(void *opaque)
     }
     rtc_set_memory(s, 0x39, val);
 
+    /*
+     * Locate the FDC at IO address 0x3f0, and configure the CMOS registers
+     * accordingly.
+     */
+    for (i = 0; i < ARRAY_SIZE(fdc_container_path); i++) {
+        container = container_get(qdev_get_machine(), fdc_container_path[i]);
+        object_child_foreach(container, check_fdc, &state);
+    }
+
+    if (state.multiple) {
+        error_report("warning: multiple floppy disk controllers with "
+                     "iobase=0x3f0 have been found;\n"
+                     "the one being picked for CMOS setup might not reflect "
+                     "your intent");
+    }
+    pc_cmos_init_floppy(s, state.floppy);
+
     qemu_unregister_reset(pc_cmos_init_late, opaque);
 }
 
 void pc_cmos_init(ram_addr_t ram_size, ram_addr_t above_4g_mem_size,
                   const char *boot_device, MachineState *machine,
-                  ISADevice *floppy, BusState *idebus0, BusState *idebus1,
+                  BusState *idebus0, BusState *idebus1,
                   ISADevice *s)
 {
-    int val, nb, i;
-    FDriveType fd_type[2] = { FDRIVE_DRV_NONE, FDRIVE_DRV_NONE };
+    int val;
     static pc_cmos_init_late_arg arg;
     PCMachineState *pc_machine = PC_MACHINE(machine);
     Error *local_err = NULL;
@@ -404,6 +493,7 @@ void pc_cmos_init(ram_addr_t ram_size, ram_addr_t above_4g_mem_size,
     rtc_set_memory(s, 0x5b, val);
     rtc_set_memory(s, 0x5c, val >> 8);
     rtc_set_memory(s, 0x5d, val >> 16);
+    rtc_set_memory(s, 0x5e, val >> 24);
 
     /* set the number of CPU */
     rtc_set_memory(s, 0x5f, smp_cpus - 1);
@@ -422,39 +512,12 @@ void pc_cmos_init(ram_addr_t ram_size, ram_addr_t above_4g_mem_size,
         exit(1);
     }
 
-    /* floppy type */
-    if (floppy) {
-        for (i = 0; i < 2; i++) {
-            fd_type[i] = isa_fdc_get_drive_type(floppy, i);
-        }
-    }
-    val = (cmos_get_fd_drive_type(fd_type[0]) << 4) |
-        cmos_get_fd_drive_type(fd_type[1]);
-    rtc_set_memory(s, 0x10, val);
-
     val = 0;
-    nb = 0;
-    if (fd_type[0] < FDRIVE_DRV_NONE) {
-        nb++;
-    }
-    if (fd_type[1] < FDRIVE_DRV_NONE) {
-        nb++;
-    }
-    switch (nb) {
-    case 0:
-        break;
-    case 1:
-        val |= 0x01; /* 1 drive, ready for boot */
-        break;
-    case 2:
-        val |= 0x41; /* 2 drives, ready for boot */
-        break;
-    }
     val |= 0x02; /* FPU is there */
     val |= 0x04; /* PS/2 mouse installed */
     rtc_set_memory(s, REG_EQUIPMENT_BYTE, val);
 
-    /* hard drives */
+    /* hard drives and FDC */
     arg.rtc_state = s;
     arg.idebus[0] = idebus0;
     arg.idebus[1] = idebus1;
@@ -1119,6 +1182,25 @@ void pc_guest_info_machine_done(Notifier *notifier, void *data)
     PcGuestInfoState *guest_info_state = container_of(notifier,
                                                       PcGuestInfoState,
                                                       machine_done);
+    PCIBus *bus = find_i440fx();
+
+    if (bus) {
+        int extra_hosts = 0;
+
+        QLIST_FOREACH(bus, &bus->child, sibling) {
+            /* look for expander root buses */
+            if (pci_bus_is_root(bus)) {
+                extra_hosts++;
+            }
+        }
+        if (extra_hosts && guest_info_state->info.fw_cfg) {
+            uint64_t *val = g_malloc(sizeof(*val));
+            *val = cpu_to_le64(extra_hosts);
+            fw_cfg_add_file(guest_info_state->info.fw_cfg,
+                    "etc/extra-pci-roots", val, sizeof(*val));
+        }
+    }
+
     acpi_setup(&guest_info_state->info);
 }
 
@@ -1291,7 +1373,7 @@ FWCfgState *pc_memory_init(MachineState *machine,
             exit(EXIT_FAILURE);
         }
 
-        pcms->hotplug_memory_base =
+        pcms->hotplug_memory.base =
             ROUND_UP(0x100000000ULL + above_4g_mem_size, 1ULL << 30);
 
         if (pcms->enforce_aligned_dimm) {
@@ -1299,17 +1381,17 @@ FWCfgState *pc_memory_init(MachineState *machine,
             hotplug_mem_size += (1ULL << 30) * machine->ram_slots;
         }
 
-        if ((pcms->hotplug_memory_base + hotplug_mem_size) <
+        if ((pcms->hotplug_memory.base + hotplug_mem_size) <
             hotplug_mem_size) {
             error_report("unsupported amount of maximum memory: " RAM_ADDR_FMT,
                          machine->maxram_size);
             exit(EXIT_FAILURE);
         }
 
-        memory_region_init(&pcms->hotplug_memory, OBJECT(pcms),
+        memory_region_init(&pcms->hotplug_memory.mr, OBJECT(pcms),
                            "hotplug-memory", hotplug_mem_size);
-        memory_region_add_subregion(system_memory, pcms->hotplug_memory_base,
-                                    &pcms->hotplug_memory);
+        memory_region_add_subregion(system_memory, pcms->hotplug_memory.base,
+                                    &pcms->hotplug_memory.mr);
     }
 
     /* Initialize PC system firmware */
@@ -1317,7 +1399,7 @@ FWCfgState *pc_memory_init(MachineState *machine,
 
     option_rom_mr = g_malloc(sizeof(*option_rom_mr));
     memory_region_init_ram(option_rom_mr, NULL, "pc.rom", PC_ROM_SIZE,
-                           &error_abort);
+                           &error_fatal);
     vmstate_register_ram_global(option_rom_mr);
     memory_region_add_subregion_overlap(rom_memory,
                                         PC_ROM_MIN_VGA,
@@ -1327,9 +1409,15 @@ FWCfgState *pc_memory_init(MachineState *machine,
     fw_cfg = bochs_bios_init();
     rom_set_fw(fw_cfg);
 
-    if (guest_info->has_reserved_memory && pcms->hotplug_memory_base) {
+    if (guest_info->has_reserved_memory && pcms->hotplug_memory.base) {
         uint64_t *val = g_malloc(sizeof(*val));
-        *val = cpu_to_le64(ROUND_UP(pcms->hotplug_memory_base, 0x1ULL << 30));
+        PCMachineClass *pcmc = PC_MACHINE_GET_CLASS(pcms);
+        uint64_t res_mem_end = pcms->hotplug_memory.base;
+
+        if (!pcmc->broken_reserved_end) {
+            res_mem_end += memory_region_size(&pcms->hotplug_memory.mr);
+        }
+        *val = cpu_to_le64(ROUND_UP(res_mem_end, 0x1ULL << 30));
         fw_cfg_add_file(fw_cfg, "etc/reserved-memory-end", val, sizeof(*val));
     }
 
@@ -1395,7 +1483,7 @@ static const MemoryRegionOps ioportF0_io_ops = {
 
 void pc_basic_device_init(ISABus *isa_bus, qemu_irq *gsi,
                           ISADevice **rtc_state,
-                          ISADevice **floppy,
+                          bool create_fdctrl,
                           bool no_vmport,
                           uint32 hpet_irqs)
 {
@@ -1465,8 +1553,9 @@ void pc_basic_device_init(ISABus *isa_bus, qemu_irq *gsi,
     }
 
     serial_hds_isa_init(isa_bus, MAX_SERIAL_PORTS);
+#if 0 /* Disabled for Red Hat Enterprise Linux 7 */
     parallel_hds_isa_init(isa_bus, MAX_PARALLEL_PORTS);
-
+#endif
     a20_line = qemu_allocate_irqs(handle_a20_line_change, first_cpu, 2);
     i8042 = isa_create_simple(isa_bus, "i8042");
     i8042_setup_a20_line(i8042, &a20_line[0]);
@@ -1489,8 +1578,11 @@ void pc_basic_device_init(ISABus *isa_bus, qemu_irq *gsi,
 
     for(i = 0; i < MAX_FD; i++) {
         fd[i] = drive_get(IF_FLOPPY, 0, i);
+        create_fdctrl |= !!fd[i];
     }
-    *floppy = fdctrl_init_isa(isa_bus, fd);
+    if (create_fdctrl) {
+        fdctrl_init_isa(isa_bus, fd);
+    }
 }
 
 void pc_nic_init(ISABus *isa_bus, PCIBus *pci_bus)
@@ -1591,70 +1683,17 @@ void qemu_register_pc_machine(QEMUMachine *m)
 static void pc_dimm_plug(HotplugHandler *hotplug_dev,
                          DeviceState *dev, Error **errp)
 {
-    int slot;
     HotplugHandlerClass *hhc;
     Error *local_err = NULL;
     PCMachineState *pcms = PC_MACHINE(hotplug_dev);
-    MachineState *machine = MACHINE(hotplug_dev);
     PCDIMMDevice *dimm = PC_DIMM(dev);
     PCDIMMDeviceClass *ddc = PC_DIMM_GET_CLASS(dimm);
     MemoryRegion *mr = ddc->get_memory_region(dimm);
-    uint64_t existing_dimms_capacity = 0;
     uint64_t align = TARGET_PAGE_SIZE;
-    uint64_t addr;
-
-    addr = object_property_get_int(OBJECT(dimm), PC_DIMM_ADDR_PROP, &local_err);
-    if (local_err) {
-        goto out;
-    }
 
     if (memory_region_get_alignment(mr) && pcms->enforce_aligned_dimm) {
         align = memory_region_get_alignment(mr);
     }
-
-    addr = pc_dimm_get_free_addr(pcms->hotplug_memory_base,
-                                 memory_region_size(&pcms->hotplug_memory),
-                                 !addr ? NULL : &addr, align,
-                                 memory_region_size(mr), &local_err);
-    if (local_err) {
-        goto out;
-    }
-
-    existing_dimms_capacity = pc_existing_dimms_capacity(&local_err);
-    if (local_err) {
-        goto out;
-    }
-
-    if (existing_dimms_capacity + memory_region_size(mr) >
-        machine->maxram_size - machine->ram_size) {
-        error_setg(&local_err, "not enough space, currently 0x%" PRIx64
-                   " in use of total hot pluggable 0x" RAM_ADDR_FMT,
-                   existing_dimms_capacity,
-                   machine->maxram_size - machine->ram_size);
-        goto out;
-    }
-
-    object_property_set_int(OBJECT(dev), addr, PC_DIMM_ADDR_PROP, &local_err);
-    if (local_err) {
-        goto out;
-    }
-    trace_mhp_pc_dimm_assigned_address(addr);
-
-    slot = object_property_get_int(OBJECT(dev), PC_DIMM_SLOT_PROP, &local_err);
-    if (local_err) {
-        goto out;
-    }
-
-    slot = pc_dimm_get_free_slot(slot == PC_DIMM_UNASSIGNED_SLOT ? NULL : &slot,
-                                 machine->ram_slots, &local_err);
-    if (local_err) {
-        goto out;
-    }
-    object_property_set_int(OBJECT(dev), slot, PC_DIMM_SLOT_PROP, &local_err);
-    if (local_err) {
-        goto out;
-    }
-    trace_mhp_pc_dimm_assigned_slot(slot);
 
     if (!pcms->acpi_dev) {
         error_setg(&local_err,
@@ -1662,18 +1701,58 @@ static void pc_dimm_plug(HotplugHandler *hotplug_dev,
         goto out;
     }
 
-    if (kvm_enabled() && !kvm_has_free_slot(machine)) {
-        error_setg(&local_err, "hypervisor has no free memory slots left");
+    pc_dimm_memory_plug(dev, &pcms->hotplug_memory, mr, align, &local_err);
+    if (local_err) {
         goto out;
     }
 
-    memory_region_add_subregion(&pcms->hotplug_memory,
-                                addr - pcms->hotplug_memory_base, mr);
-    vmstate_register_ram(mr, dev);
+    hhc = HOTPLUG_HANDLER_GET_CLASS(pcms->acpi_dev);
+    hhc->plug(HOTPLUG_HANDLER(pcms->acpi_dev), dev, &error_abort);
+out:
+    error_propagate(errp, local_err);
+}
+
+static void pc_dimm_unplug_request(HotplugHandler *hotplug_dev,
+                                   DeviceState *dev, Error **errp)
+{
+    HotplugHandlerClass *hhc;
+    Error *local_err = NULL;
+    PCMachineState *pcms = PC_MACHINE(hotplug_dev);
+
+    if (!pcms->acpi_dev) {
+        error_setg(&local_err,
+                   "memory hotplug is not enabled: missing acpi device");
+        goto out;
+    }
 
     hhc = HOTPLUG_HANDLER_GET_CLASS(pcms->acpi_dev);
-    hhc->plug(HOTPLUG_HANDLER(pcms->acpi_dev), dev, &local_err);
+    hhc->unplug_request(HOTPLUG_HANDLER(pcms->acpi_dev), dev, &local_err);
+
 out:
+    error_propagate(errp, local_err);
+}
+
+static void pc_dimm_unplug(HotplugHandler *hotplug_dev,
+                           DeviceState *dev, Error **errp)
+{
+    PCMachineState *pcms = PC_MACHINE(hotplug_dev);
+    PCDIMMDevice *dimm = PC_DIMM(dev);
+    PCDIMMDeviceClass *ddc = PC_DIMM_GET_CLASS(dimm);
+    MemoryRegion *mr = ddc->get_memory_region(dimm);
+    HotplugHandlerClass *hhc;
+    Error *local_err = NULL;
+
+    hhc = HOTPLUG_HANDLER_GET_CLASS(pcms->acpi_dev);
+    hhc->unplug(HOTPLUG_HANDLER(pcms->acpi_dev), dev, &local_err);
+
+    if (local_err) {
+        goto out;
+    }
+
+    pc_dimm_memory_unplug(dev, &pcms->hotplug_memory, mr);
+    object_unparent(OBJECT(dev));
+
+ out:
     error_propagate(errp, local_err);
 }
 
@@ -1719,15 +1798,23 @@ static void pc_machine_device_plug_cb(HotplugHandler *hotplug_dev,
 static void pc_machine_device_unplug_request_cb(HotplugHandler *hotplug_dev,
                                                 DeviceState *dev, Error **errp)
 {
-    error_setg(errp, "acpi: device unplug request for not supported device"
-               " type: %s", object_get_typename(OBJECT(dev)));
+    if (object_dynamic_cast(OBJECT(dev), TYPE_PC_DIMM)) {
+        pc_dimm_unplug_request(hotplug_dev, dev, errp);
+    } else {
+        error_setg(errp, "acpi: device unplug request for not supported device"
+                   " type: %s", object_get_typename(OBJECT(dev)));
+    }
 }
 
 static void pc_machine_device_unplug_cb(HotplugHandler *hotplug_dev,
                                         DeviceState *dev, Error **errp)
 {
-    error_setg(errp, "acpi: device unplug for not supported device"
-               " type: %s", object_get_typename(OBJECT(dev)));
+    if (object_dynamic_cast(OBJECT(dev), TYPE_PC_DIMM)) {
+        pc_dimm_unplug(hotplug_dev, dev, errp);
+    } else {
+        error_setg(errp, "acpi: device unplug for not supported device"
+                   " type: %s", object_get_typename(OBJECT(dev)));
+    }
 }
 
 static HotplugHandler *pc_get_hotpug_handler(MachineState *machine,
@@ -1749,7 +1836,7 @@ pc_machine_get_hotplug_memory_region_size(Object *obj, Visitor *v, void *opaque,
                                           const char *name, Error **errp)
 {
     PCMachineState *pcms = PC_MACHINE(obj);
-    int64_t value = memory_region_size(&pcms->hotplug_memory);
+    int64_t value = memory_region_size(&pcms->hotplug_memory.mr);
 
     visit_type_int(v, &value, name, errp);
 }

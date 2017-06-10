@@ -399,7 +399,7 @@ static void scsi_read_data(SCSIRequest *req)
  */
 static int scsi_handle_rw_error(SCSIDiskReq *r, int error)
 {
-    bool is_read = (r->req.cmd.xfer == SCSI_XFER_FROM_DEV);
+    bool is_read = (r->req.cmd.mode == SCSI_XFER_FROM_DEV);
     SCSIDiskState *s = DO_UPCAST(SCSIDiskState, qdev, r->req.dev);
     BlockErrorAction action = blk_get_error_action(s->qdev.conf.blk,
                                                    is_read, error);
@@ -1669,6 +1669,10 @@ static void scsi_write_same_complete(void *opaque, int ret)
     if (data->iov.iov_len) {
         block_acct_start(blk_get_stats(s->qdev.conf.blk), &r->acct,
                          data->iov.iov_len, BLOCK_ACCT_WRITE);
+        /* blk_aio_write doesn't like the qiov size being different from
+         * nb_sectors, make sure they match.
+         */
+        qemu_iovec_init_external(&data->qiov, &data->iov, 1);
         r->req.aiocb = blk_aio_writev(s->qdev.conf.blk, data->sector,
                                       &data->qiov, data->iov.iov_len / 512,
                                       scsi_write_same_complete, data);

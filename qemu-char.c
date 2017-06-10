@@ -3042,6 +3042,7 @@ static void tcp_chr_close(CharDriverState *chr)
         if (s->listen_chan) {
             g_io_channel_unref(s->listen_chan);
         }
+        socket_listen_cleanup(s->listen_fd, NULL);
         closesocket(s->listen_fd);
     }
     if (s->read_msgfds_num) {
@@ -3837,6 +3838,13 @@ void qemu_chr_fe_release(CharDriverState *s)
     s->avail_connections++;
 }
 
+void qemu_chr_disconnect(CharDriverState *chr)
+{
+    if (chr->chr_disconnect) {
+        chr->chr_disconnect(chr);
+    }
+}
+
 void qemu_chr_delete(CharDriverState *chr)
 {
     QTAILQ_REMOVE(&chardevs, chr, next);
@@ -4155,6 +4163,7 @@ static CharDriverState *qmp_chardev_open_socket(ChardevSocket *sock,
     chr->chr_write = tcp_chr_write;
     chr->chr_sync_read = tcp_chr_sync_read;
     chr->chr_close = tcp_chr_close;
+    chr->chr_disconnect = tcp_chr_disconnect;
     chr->get_msgfds = tcp_get_msgfds;
     chr->set_msgfds = tcp_set_msgfds;
     chr->chr_add_client = tcp_chr_add_client;
@@ -4336,6 +4345,15 @@ void qmp_chardev_remove(const char *id, Error **errp)
         return;
     }
     qemu_chr_delete(chr);
+}
+
+void qemu_chr_cleanup(void)
+{
+    CharDriverState *chr, *tmp;
+
+    QTAILQ_FOREACH_SAFE(chr, &chardevs, next, tmp) {
+        qemu_chr_delete(chr);
+    }
 }
 
 static void register_types(void)

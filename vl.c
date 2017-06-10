@@ -120,8 +120,6 @@ int main(int argc, char **argv)
 #include "qom/object_interfaces.h"
 #include "qapi-event.h"
 
-#define DEFAULT_RAM_SIZE 128
-
 #define MAX_VIRTIO_CONSOLES 1
 #define MAX_SCLP_CONSOLES 1
 
@@ -161,7 +159,7 @@ int max_cpus = 0;
 int smp_cores = 1;
 int smp_threads = 1;
 int acpi_enabled = 1;
-int no_hpet = 0;
+int no_hpet = 1; /* Always disabled for Red Hat Enterprise Linux */
 int fd_bootchk = 1;
 static int no_reboot;
 int no_shutdown = 0;
@@ -547,8 +545,14 @@ static const RunStateTransition runstate_transitions_def[] = {
     { RUN_STATE_DEBUG, RUN_STATE_RUNNING },
     { RUN_STATE_DEBUG, RUN_STATE_FINISH_MIGRATE },
 
-    { RUN_STATE_INMIGRATE, RUN_STATE_RUNNING },
+    { RUN_STATE_INMIGRATE, RUN_STATE_INTERNAL_ERROR },
+    { RUN_STATE_INMIGRATE, RUN_STATE_IO_ERROR },
     { RUN_STATE_INMIGRATE, RUN_STATE_PAUSED },
+    { RUN_STATE_INMIGRATE, RUN_STATE_RUNNING },
+    { RUN_STATE_INMIGRATE, RUN_STATE_SHUTDOWN },
+    { RUN_STATE_INMIGRATE, RUN_STATE_SUSPENDED },
+    { RUN_STATE_INMIGRATE, RUN_STATE_WATCHDOG },
+    { RUN_STATE_INMIGRATE, RUN_STATE_GUEST_PANICKED },
 
     { RUN_STATE_INTERNAL_ERROR, RUN_STATE_PAUSED },
     { RUN_STATE_INTERNAL_ERROR, RUN_STATE_FINISH_MIGRATE },
@@ -606,6 +610,18 @@ static bool runstate_valid_transitions[RUN_STATE_MAX][RUN_STATE_MAX];
 bool runstate_check(RunState state)
 {
     return current_run_state == state;
+}
+
+bool runstate_store(char *str, size_t size)
+{
+    const char *state = RunState_lookup[current_run_state];
+    size_t len = strlen(state) + 1;
+
+    if (len > size) {
+        return false;
+    }
+    memcpy(str, state, len);
+    return true;
 }
 
 static void runstate_init(void)
@@ -1309,7 +1325,11 @@ void hmp_usb_del(Monitor *mon, const QDict *qdict)
 
 MachineState *current_machine;
 
-static void machine_class_init(ObjectClass *oc, void *data)
+/*
+ * Transitional class registration/init used for converting from
+ * legacy QEMUMachine to MachineClass.
+ */
+static void qemu_machine_class_init(ObjectClass *oc, void *data)
 {
     MachineClass *mc = MACHINE_CLASS(oc);
     QEMUMachine *qm = data;
@@ -1347,7 +1367,7 @@ int qemu_register_machine(QEMUMachine *m)
     TypeInfo ti = {
         .name       = name,
         .parent     = TYPE_MACHINE,
-        .class_init = machine_class_init,
+        .class_init = qemu_machine_class_init,
         .class_data = (void *)m,
     };
 
@@ -1807,9 +1827,17 @@ static void version(void)
     printf("QEMU emulator version " QEMU_VERSION QEMU_PKGVERSION ", Copyright (c) 2003-2008 Fabrice Bellard\n");
 }
 
+static void print_rh_warning(void)
+{
+    printf("\nWARNING: Direct use of qemu-kvm from the command line is not supported by Red Hat.\n"
+             "WARNING: Use libvirt as the stable management interface.\n"
+             "WARNING: Some command line options listed here may not be available in future releases.\n\n");
+}
+
 static void help(int exitcode)
 {
     version();
+    print_rh_warning();
     printf("usage: %s [options] [disk_image]\n\n"
            "'disk_image' is a raw hard disk image for IDE hard disk 0\n\n",
             error_get_progname());
@@ -1824,6 +1852,7 @@ static void help(int exitcode)
            "\n"
            "When using -nographic, press 'ctrl-a h' to get some help.\n");
 
+    print_rh_warning();
     exit(exitcode);
 }
 
@@ -2643,13 +2672,13 @@ out:
     return 0;
 }
 
-static void set_memory_options(uint64_t *ram_slots, ram_addr_t *maxram_size)
+static void set_memory_options(uint64_t *ram_slots, ram_addr_t *maxram_size,
+                               MachineClass *mc)
 {
     uint64_t sz;
     const char *mem_str;
     const char *maxmem_str, *slots_str;
-    const ram_addr_t default_ram_size = (ram_addr_t)DEFAULT_RAM_SIZE *
-                                        1024 * 1024;
+    const ram_addr_t default_ram_size = mc->default_ram_size;
     QemuOpts *opts = qemu_find_opts_singleton("memory");
 
     sz = 0;
@@ -2680,6 +2709,7 @@ static void set_memory_options(uint64_t *ram_slots, ram_addr_t *maxram_size)
     }
 
     sz = QEMU_ALIGN_UP(sz, 8192);
+    sz = MAX(sz, 2 * 1024 * 1024);
     ram_size = sz;
     if (ram_size != sz) {
         error_report("ram size too large");
@@ -2783,6 +2813,7 @@ int main(int argc, char **argv, char **envp)
     qemu_add_drive_opts(&qemu_legacy_drive_opts);
     qemu_add_drive_opts(&qemu_common_drive_opts);
     qemu_add_drive_opts(&qemu_drive_opts);
+    qemu_add_opts(&qemu_simple_drive_opts);
     qemu_add_opts(&qemu_chardev_opts);
     qemu_add_opts(&qemu_device_opts);
     qemu_add_opts(&qemu_netdev_opts);
@@ -3765,7 +3796,13 @@ int main(int argc, char **argv, char **envp)
         machine_class = machine_parse(optarg);
     }
 
-    set_memory_options(&ram_slots, &maxram_size);
+    if (machine_class == NULL) {
+        fprintf(stderr, "No machine specified, and there is no default.\n"
+                "Use -machine help to list supported machines!\n");
+        exit(1);
+    }
+
+    set_memory_options(&ram_slots, &maxram_size, machine_class);
 
     loc_set_none();
 
@@ -3793,12 +3830,6 @@ int main(int argc, char **argv, char **envp)
         exit(1);
     }
 #endif
-
-    if (machine_class == NULL) {
-        fprintf(stderr, "No machine specified, and there is no default.\n"
-                "Use -machine help to list supported machines!\n");
-        exit(1);
-    }
 
     current_machine = MACHINE(object_new(object_class_get_name(
                           OBJECT_CLASS(machine_class))));
@@ -4124,9 +4155,6 @@ int main(int argc, char **argv, char **envp)
         qemu_opts_del(icount_opts);
     }
 
-    /* clean up network at qemu process termination */
-    atexit(&net_cleanup);
-
     if (net_init_clients() < 0) {
         exit(1);
     }
@@ -4325,6 +4353,7 @@ int main(int argc, char **argv, char **envp)
     rom_load_done();
 
     qemu_system_reset(VMRESET_SILENT);
+    register_global_state();
     if (loadvm) {
         if (load_vmstate(loadvm) < 0) {
             autostart = 0;
@@ -4366,6 +4395,9 @@ int main(int argc, char **argv, char **envp)
 #ifdef CONFIG_TPM
     tpm_cleanup();
 #endif
+    net_cleanup();
+
+    qemu_chr_cleanup();
 
     return 0;
 }

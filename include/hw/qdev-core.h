@@ -114,6 +114,19 @@ typedef struct DeviceClass {
      * TODO remove once we're there
      */
     bool cannot_instantiate_with_device_add_yet;
+    /*
+     * Does this device model survive object_unref(object_new(TNAME))?
+     * All device models should, and this flag shouldn't exist.  Some
+     * devices crash in object_new(), some crash or hang in
+     * object_unref().  Makes introspecting properties with
+     * qmp_device_list_properties() dangerous.  Bad, because it's used
+     * by -device FOO,help.  This flag serves to protect that code.
+     * It should never be set without a comment explaining why it is
+     * set.
+     * TODO remove once we're there
+     */
+    bool cannot_destroy_with_object_finalize_yet;
+
     bool hotpluggable;
 
     /* callbacks */
@@ -266,6 +279,7 @@ int qdev_init(DeviceState *dev) QEMU_WARN_UNUSED_RESULT;
 void qdev_init_nofail(DeviceState *dev);
 void qdev_set_legacy_instance_id(DeviceState *dev, int alias_id,
                                  int required_for_version);
+HotplugHandler *qdev_get_hotplug_handler(DeviceState *dev);
 void qdev_unplug(DeviceState *dev, Error **errp);
 void qdev_simple_device_unplug_cb(HotplugHandler *hotplug_dev,
                                   DeviceState *dev, Error **errp);

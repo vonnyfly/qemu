@@ -335,7 +335,10 @@ tpm="yes"
 libssh2=""
 vhdx=""
 quorum=""
+live_block_migration="no"
 numa=""
+tcmalloc="no"
+
 
 # parse CC options first
 for opt do
@@ -1134,6 +1137,14 @@ for opt do
   ;;
   --enable-numa) numa="yes"
   ;;
+  --disable-live-block-migration) live_block_migration="no"
+  ;;
+  --enable-live-block-migration) live_block_migration="yes"
+  ;;
+  --disable-tcmalloc) tcmalloc="no"
+  ;;
+  --enable-tcmalloc) tcmalloc="yes"
+  ;;
   *)
       echo "ERROR: unknown option $opt"
       echo "Try '$0 --help' for more information"
@@ -1275,6 +1286,7 @@ Advanced options (experts only):
   --disable-strip          disable stripping binaries
   --disable-werror         disable compilation abort on warning
   --disable-stack-protector disable compiler-provided stack protection
+  --enable-stack-protector enable compiler-provided stack protection
   --disable-sdl            disable SDL
   --enable-sdl             enable SDL
   --with-sdlabi            select preferred SDL ABI 1.2 or 2.0
@@ -1405,8 +1417,12 @@ Advanced options (experts only):
   --enable-vhdx            enable support for the Microsoft VHDX image format
   --disable-quorum         disable quorum block filter support
   --enable-quorum          enable quorum block filter support
+  --disable-live-block-migration disable live block migration
+  --enable-live-block-migration  enable live block migration
   --disable-numa           disable libnuma support
   --enable-numa            enable libnuma support
+  --disable-tcmalloc       disable tcmalloc support
+  --enable-tcmalloc        enable tcmalloc support
 
 NOTE: The object files are built at the place where configure is launched
 EOF
@@ -1848,7 +1864,7 @@ fi
 # libseccomp check
 
 if test "$seccomp" != "no" ; then
-    if test "$cpu" = "i386" || test "$cpu" = "x86_64" &&
+    if test "$cpu" = "i386" || test "$cpu" = "x86_64" || test "$cpu" = "aarch64" &&
         $pkg_config --atleast-version=2.1.1 libseccomp; then
         libs_softmmu="$libs_softmmu `$pkg_config --libs libseccomp`"
         QEMU_CFLAGS="$QEMU_CFLAGS `$pkg_config --cflags libseccomp`"
@@ -3331,6 +3347,22 @@ EOF
 fi
 
 ##########################################
+# tcmalloc probe
+
+if test "$tcmalloc" = "yes" ; then
+  cat > $TMPC << EOF
+#include <stdlib.h>
+int main(void) { malloc(1); return 0; }
+EOF
+
+  if compile_prog "" "-ltcmalloc" ; then
+    LIBS="-ltcmalloc $LIBS"
+  else
+    feature_not_found "tcmalloc" "install gperftools devel"
+  fi
+fi
+
+##########################################
 # signalfd probe
 signalfd="no"
 cat > $TMPC << EOF
@@ -3357,6 +3389,22 @@ EOF
 if compile_prog "" "" ; then
   eventfd=yes
 fi
+
+# check if memfd is supported
+memfd=no
+cat > $TMPC << EOF
+#include <sys/memfd.h>
+
+int main(void)
+{
+    return memfd_create("foo", MFD_ALLOW_SEALING);
+}
+EOF
+if compile_prog "" "" ; then
+  memfd=yes
+fi
+
+
 
 # check for fallocate
 fallocate=no
@@ -4440,7 +4488,9 @@ echo "Quorum            $quorum"
 echo "lzo support       $lzo"
 echo "snappy support    $snappy"
 echo "bzip2 support     $bzip2"
+echo "Live block migration $live_block_migration"
 echo "NUMA host support $numa"
+echo "tcmalloc support  $tcmalloc"
 
 if test "$sdl_too_old" = "yes"; then
 echo "-> Your SDL version is too old - please upgrade to have SDL support"
@@ -4631,6 +4681,9 @@ if test "$splice" = "yes" ; then
 fi
 if test "$eventfd" = "yes" ; then
   echo "CONFIG_EVENTFD=y" >> $config_host_mak
+fi
+if test "$memfd" = "yes" ; then
+  echo "CONFIG_MEMFD=y" >> $config_host_mak
 fi
 if test "$fallocate" = "yes" ; then
   echo "CONFIG_FALLOCATE=y" >> $config_host_mak
@@ -4905,6 +4958,10 @@ fi
 
 if test "$vhdx" = "yes" ; then
   echo "CONFIG_VHDX=y" >> $config_host_mak
+fi
+
+if test "$live_block_migration" = "yes" ; then
+  echo "CONFIG_LIVE_BLOCK_MIGRATION=y" >> $config_host_mak
 fi
 
 # USB host support
@@ -5280,6 +5337,7 @@ case "$target_name" in
       echo "CONFIG_KVM=y" >> $config_target_mak
       if test "$vhost_net" = "yes" ; then
         echo "CONFIG_VHOST_NET=y" >> $config_target_mak
+        echo "CONFIG_VHOST_NET_TEST_$target_name=y" >> $config_host_mak
       fi
     fi
 esac

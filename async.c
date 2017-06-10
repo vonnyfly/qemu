@@ -226,11 +226,10 @@ aio_ctx_finalize(GSource     *source)
     AioContext *ctx = (AioContext *) source;
 
     thread_pool_free(ctx->thread_pool);
-    aio_set_event_notifier(ctx, &ctx->notifier, NULL);
+    aio_set_event_notifier(ctx, &ctx->notifier, AIO_CLIENT_CONTEXT, NULL);
     event_notifier_cleanup(&ctx->notifier);
     rfifolock_destroy(&ctx->lock);
     qemu_mutex_destroy(&ctx->bh_lock);
-    g_array_free(ctx->pollfds, TRUE);
     timerlistgroup_deinit(&ctx->tlg);
 }
 
@@ -273,6 +272,9 @@ void aio_notify(AioContext *ctx)
     smp_mb();
     if (!ctx->dispatching) {
         event_notifier_set(&ctx->notifier);
+#ifdef HOST_AARCH64
+        kill(getpid(), SIGIO);
+#endif
     }
 }
 
@@ -300,9 +302,9 @@ AioContext *aio_context_new(Error **errp)
     }
     g_source_set_can_recurse(&ctx->source, true);
     aio_set_event_notifier(ctx, &ctx->notifier,
+                           AIO_CLIENT_CONTEXT,
                            (EventNotifierHandler *)
                            event_notifier_test_and_clear);
-    ctx->pollfds = g_array_new(FALSE, FALSE, sizeof(GPollFD));
     ctx->thread_pool = NULL;
     qemu_mutex_init(&ctx->bh_lock);
     rfifolock_init(&ctx->lock, aio_rfifolock_cb, ctx);

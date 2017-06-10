@@ -72,6 +72,9 @@ static int virtio_blk_handle_rw_error(VirtIOBlockReq *req, int error,
     VirtIOBlock *s = req->dev;
 
     if (action == BLOCK_ERROR_ACTION_STOP) {
+        /* Break the link as the next request is going to be parsed from the
+         * ring again. Otherwise we may end up doing a double completion! */
+        req->mr_next = NULL;
         req->next = s->rq;
         s->rq = req;
     } else if (action == BLOCK_ERROR_ACTION_REPORT) {
@@ -601,6 +604,8 @@ static void virtio_blk_handle_output(VirtIODevice *vdev, VirtQueue *vq)
         return;
     }
 
+    blk_io_plug(s->blk);
+
     while ((req = virtio_blk_get_request(s))) {
         virtio_blk_handle_request(req, &mrb);
     }
@@ -608,6 +613,8 @@ static void virtio_blk_handle_output(VirtIODevice *vdev, VirtQueue *vq)
     if (mrb.num_reqs) {
         virtio_blk_submit_multireq(s->blk, &mrb);
     }
+
+    blk_io_unplug(s->blk);
 }
 
 static void virtio_blk_dma_restart_bh(void *opaque)
@@ -718,7 +725,8 @@ static void virtio_blk_set_config(VirtIODevice *vdev, const uint8_t *config)
     aio_context_release(blk_get_aio_context(s->blk));
 }
 
-static uint32_t virtio_blk_get_features(VirtIODevice *vdev, uint32_t features)
+static uint64_t virtio_blk_get_features(VirtIODevice *vdev, uint64_t features,
+                                        Error **errp)
 {
     VirtIOBlock *s = VIRTIO_BLK(vdev);
 
@@ -726,7 +734,15 @@ static uint32_t virtio_blk_get_features(VirtIODevice *vdev, uint32_t features)
     virtio_add_feature(&features, VIRTIO_BLK_F_GEOMETRY);
     virtio_add_feature(&features, VIRTIO_BLK_F_TOPOLOGY);
     virtio_add_feature(&features, VIRTIO_BLK_F_BLK_SIZE);
-    virtio_add_feature(&features, VIRTIO_BLK_F_SCSI);
+    if (virtio_has_feature(features, VIRTIO_F_VERSION_1)) {
+        if (s->conf.scsi) {
+            error_setg(errp, "Please set scsi=off for virtio-blk devices in order to use virtio 1.0");
+            return 0;
+        }
+    } else {
+        virtio_clear_feature(&features, VIRTIO_F_ANY_LAYOUT);
+        virtio_add_feature(&features, VIRTIO_BLK_F_SCSI);
+    }
 
     if (s->conf.config_wce) {
         virtio_add_feature(&features, VIRTIO_BLK_F_CONFIG_WCE);
@@ -769,10 +785,11 @@ static void virtio_blk_set_status(VirtIODevice *vdev, uint8_t status)
      *
      * s->blk would erroneously be placed in writethrough mode.
      */
-    if (!virtio_has_feature(vdev, VIRTIO_BLK_F_CONFIG_WCE)) {
+    if (!virtio_vdev_has_feature(vdev, VIRTIO_BLK_F_CONFIG_WCE)) {
         aio_context_acquire(blk_get_aio_context(s->blk));
         blk_set_enable_write_cache(s->blk,
-                                   virtio_has_feature(vdev, VIRTIO_BLK_F_WCE));
+                                   virtio_vdev_has_feature(vdev,
+                                                           VIRTIO_BLK_F_WCE));
         aio_context_release(blk_get_aio_context(s->blk));
     }
 }
@@ -821,10 +838,7 @@ static int virtio_blk_load_device(VirtIODevice *vdev, QEMUFile *f,
         req->next = s->rq;
         s->rq = req;
 
-        virtqueue_map_sg(req->elem.in_sg, req->elem.in_addr,
-            req->elem.in_num, 1);
-        virtqueue_map_sg(req->elem.out_sg, req->elem.out_addr,
-            req->elem.out_num, 0);
+        virtqueue_map(&req->elem);
     }
 
     return 0;

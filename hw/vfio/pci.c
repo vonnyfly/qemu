@@ -193,6 +193,7 @@ static const VFIORomBlacklistEntry romblacklist[] = {
 };
 
 #define MSIX_CAP_LENGTH 12
+#define MAX_DEV_ASSIGN_CMDLINE 32
 
 static void vfio_disable_interrupts(VFIOPCIDevice *vdev);
 static uint32_t vfio_pci_read_config(PCIDevice *pdev, uint32_t addr, int len);
@@ -1531,9 +1532,12 @@ static uint64_t vfio_rtl8168_window_quirk_read(void *opaque,
                 return 0;
             }
 
-            io_mem_read(&vdev->pdev.msix_table_mmio,
-                        (hwaddr)(quirk->data.address_match & 0xfff),
-                        &val, size);
+            memory_region_dispatch_read(&vdev->pdev.msix_table_mmio,
+                                        (hwaddr)(quirk->data.address_match
+                                                 & 0xfff),
+                                        &val,
+                                        size,
+                                        MEMTXATTRS_UNSPECIFIED);
             return val;
         }
     }
@@ -1561,9 +1565,12 @@ static void vfio_rtl8168_window_quirk_write(void *opaque, hwaddr addr,
                         memory_region_name(&quirk->mem),
                         vdev->vbasedev.name);
 
-                io_mem_write(&vdev->pdev.msix_table_mmio,
-                             (hwaddr)(quirk->data.address_match & 0xfff),
-                             data, size);
+                memory_region_dispatch_write(&vdev->pdev.msix_table_mmio,
+                                             (hwaddr)(quirk->data.address_match
+                                                      & 0xfff),
+                                             data,
+                                             size,
+                                             MEMTXATTRS_UNSPECIFIED);
             }
 
             quirk->data.flags = 1;
@@ -2245,6 +2252,33 @@ static int vfio_early_setup_msix(VFIOPCIDevice *vdev)
     vdev->msix->pba_offset = pba & ~PCI_MSIX_FLAGS_BIRMASK;
     vdev->msix->entries = (ctrl & PCI_MSIX_FLAGS_QSIZE) + 1;
 
+    /*
+     * Test the size of the pba_offset variable and catch if it extends outside
+     * of the specified BAR. If it is the case, we need to apply a hardware
+     * specific quirk if the device is known or we have a broken configuration.
+     */
+    if (vdev->msix->pba_offset >=
+        vdev->bars[vdev->msix->pba_bar].region.size) {
+
+        PCIDevice *pdev = &vdev->pdev;
+        uint16_t vendor = pci_get_word(pdev->config + PCI_VENDOR_ID);
+        uint16_t device = pci_get_word(pdev->config + PCI_DEVICE_ID);
+
+        /*
+         * Chelsio T5 Virtual Function devices are encoded as 0x58xx for T5
+         * adapters. The T5 hardware returns an incorrect value of 0x8000 for
+         * the VF PBA offset while the BAR itself is only 8k. The correct value
+         * is 0x1000, so we hard code that here.
+         */
+        if (vendor == PCI_VENDOR_ID_CHELSIO && (device & 0xff00) == 0x5800) {
+            vdev->msix->pba_offset = 0x1000;
+        } else {
+            error_report("vfio: Hardware reports invalid configuration, "
+                         "MSIX PBA outside of specified BAR");
+            return -EINVAL;
+        }
+    }
+
     trace_vfio_early_setup_msix(vdev->vbasedev.name, pos,
                                 vdev->msix->table_bar,
                                 vdev->msix->table_offset,
@@ -2394,7 +2428,7 @@ static void vfio_map_bar(VFIOPCIDevice *vdev, int nr)
     if (vdev->msix && vdev->msix->table_bar == nr) {
         uint64_t start;
 
-        start = HOST_PAGE_ALIGN(vdev->msix->table_offset +
+        start = HOST_PAGE_ALIGN((uint64_t)vdev->msix->table_offset +
                                 (vdev->msix->entries * PCI_MSIX_ENTRY_SIZE));
 
         size = start < bar->region.size ? bar->region.size - start : 0;
@@ -3328,7 +3362,19 @@ static int vfio_initfn(PCIDevice *pdev)
     ssize_t len;
     struct stat st;
     int groupid;
-    int ret;
+    int ret, i = 0;
+
+    QLIST_FOREACH(group, &vfio_group_list, next) {
+        QLIST_FOREACH(vbasedev_iter, &group->device_list, next) {
+            i++;
+        }
+    }
+
+    if (i >= MAX_DEV_ASSIGN_CMDLINE) {
+        error_report("vfio: Maximum supported vfio devices (%d) "
+                     "already attached\n", MAX_DEV_ASSIGN_CMDLINE);
+        return -1;
+    }
 
     /* Check that the host device exists */
     snprintf(path, sizeof(path),
@@ -3352,7 +3398,7 @@ static int vfio_initfn(PCIDevice *pdev)
     len = readlink(path, iommu_group_path, sizeof(path));
     if (len <= 0 || len >= sizeof(path)) {
         error_report("vfio: error no iommu_group for device");
-        return len < 0 ? -errno : ENAMETOOLONG;
+        return len < 0 ? -errno : -ENAMETOOLONG;
     }
 
     iommu_group_path[len] = 0;
@@ -3555,7 +3601,6 @@ static Property vfio_pci_dev_properties[] = {
                     VFIO_FEATURE_ENABLE_VGA_BIT, false),
     DEFINE_PROP_BIT("x-req", VFIOPCIDevice, features,
                     VFIO_FEATURE_ENABLE_REQ_BIT, true),
-    DEFINE_PROP_INT32("bootindex", VFIOPCIDevice, bootindex, -1),
     DEFINE_PROP_BOOL("x-mmap", VFIOPCIDevice, vbasedev.allow_mmap, true),
     /*
      * TODO - support passed fds... is this necessary?

@@ -33,6 +33,7 @@
 #include "qemu/timer.h"
 #include "hw/isa/isa.h"
 #include "hw/sysbus.h"
+#include "migration/migration.h"
 #include "sysemu/block-backend.h"
 #include "sysemu/blockdev.h"
 #include "sysemu/sysemu.h"
@@ -673,6 +674,7 @@ static const VMStateDescription vmstate_fdrive_media_changed = {
     .name = "fdrive/media_changed",
     .version_id = 1,
     .minimum_version_id = 1,
+    .needed = fdrive_media_changed_needed,
     .fields = (VMStateField[]) {
         VMSTATE_UINT8(media_changed, FDrive),
         VMSTATE_END_OF_LIST()
@@ -690,6 +692,7 @@ static const VMStateDescription vmstate_fdrive_media_rate = {
     .name = "fdrive/media_rate",
     .version_id = 1,
     .minimum_version_id = 1,
+    .needed = fdrive_media_rate_needed,
     .fields = (VMStateField[]) {
         VMSTATE_UINT8(media_rate, FDrive),
         VMSTATE_END_OF_LIST()
@@ -700,6 +703,10 @@ static bool fdrive_perpendicular_needed(void *opaque)
 {
     FDrive *drive = opaque;
 
+    if (migrate_pre_2_2) {
+        return false;
+    }
+
     return drive->perpendicular != 0;
 }
 
@@ -707,6 +714,7 @@ static const VMStateDescription vmstate_fdrive_perpendicular = {
     .name = "fdrive/perpendicular",
     .version_id = 1,
     .minimum_version_id = 1,
+    .needed = fdrive_perpendicular_needed,
     .fields = (VMStateField[]) {
         VMSTATE_UINT8(perpendicular, FDrive),
         VMSTATE_END_OF_LIST()
@@ -730,19 +738,11 @@ static const VMStateDescription vmstate_fdrive = {
         VMSTATE_UINT8(sect, FDrive),
         VMSTATE_END_OF_LIST()
     },
-    .subsections = (VMStateSubsection[]) {
-        {
-            .vmsd = &vmstate_fdrive_media_changed,
-            .needed = &fdrive_media_changed_needed,
-        } , {
-            .vmsd = &vmstate_fdrive_media_rate,
-            .needed = &fdrive_media_rate_needed,
-        } , {
-            .vmsd = &vmstate_fdrive_perpendicular,
-            .needed = &fdrive_perpendicular_needed,
-        } , {
-            /* empty */
-        }
+    .subsections = (const VMStateDescription*[]) {
+        &vmstate_fdrive_media_changed,
+        &vmstate_fdrive_media_rate,
+        &vmstate_fdrive_perpendicular,
+        NULL
     }
 };
 
@@ -765,14 +765,27 @@ static int fdc_post_load(void *opaque, int version_id)
 static bool fdc_reset_sensei_needed(void *opaque)
 {
     FDCtrl *s = opaque;
+    bool needed = s->reset_sensei != 0;
 
-    return s->reset_sensei != 0;
+    if (migrate_pre_2_2) {
+        /*
+         * This probably wont matter for most OSs, but it's good to log
+         * it just incase we find it causes problems.
+         */
+        if (needed) {
+            error_report("INFO: fdc migration just after reset (sensei!=0)");
+        }
+        return false;
+    }
+
+    return needed;
 }
 
 static const VMStateDescription vmstate_fdc_reset_sensei = {
     .name = "fdc/reset_sensei",
     .version_id = 1,
     .minimum_version_id = 1,
+    .needed = fdc_reset_sensei_needed,
     .fields = (VMStateField[]) {
         VMSTATE_INT32(reset_sensei, FDCtrl),
         VMSTATE_END_OF_LIST()
@@ -782,14 +795,33 @@ static const VMStateDescription vmstate_fdc_reset_sensei = {
 static bool fdc_result_timer_needed(void *opaque)
 {
     FDCtrl *s = opaque;
+    bool needed = timer_pending(s->result_timer);
 
-    return timer_pending(s->result_timer);
+    if (migrate_pre_2_2) {
+        /*
+         * This could upset some OSs if their read-id command doesn't
+         * complete, so lets log something.
+         */
+        if (needed) {
+            error_report("INFO: fdc migration just after read-id (timer!=0)");
+        }
+        /*
+         * However, since it's not apparently caused us problems for many
+         * years, don't fail the migration, especially as this could
+         * happen as part of a background drive-probe which if it fails
+         * won't be a problem.
+         */
+        return false;
+    }
+
+    return needed;
 }
 
 static const VMStateDescription vmstate_fdc_result_timer = {
     .name = "fdc/result_timer",
     .version_id = 1,
     .minimum_version_id = 1,
+    .needed = fdc_result_timer_needed,
     .fields = (VMStateField[]) {
         VMSTATE_TIMER_PTR(result_timer, FDCtrl),
         VMSTATE_END_OF_LIST()
@@ -833,16 +865,10 @@ static const VMStateDescription vmstate_fdc = {
                              vmstate_fdrive, FDrive),
         VMSTATE_END_OF_LIST()
     },
-    .subsections = (VMStateSubsection[]) {
-        {
-            .vmsd = &vmstate_fdc_reset_sensei,
-            .needed = fdc_reset_sensei_needed,
-        } , {
-            .vmsd = &vmstate_fdc_result_timer,
-            .needed = fdc_result_timer_needed,
-        } , {
-            /* empty */
-        }
+    .subsections = (const VMStateDescription*[]) {
+        &vmstate_fdc_reset_sensei,
+        &vmstate_fdc_result_timer,
+        NULL
     }
 };
 
@@ -1512,7 +1538,7 @@ static uint32_t fdctrl_read_data(FDCtrl *fdctrl)
 {
     FDrive *cur_drv;
     uint32_t retval = 0;
-    int pos;
+    uint32_t pos;
 
     cur_drv = get_cur_drv(fdctrl);
     fdctrl->dsr &= ~FD_DSR_PWRDOWN;
@@ -1521,8 +1547,8 @@ static uint32_t fdctrl_read_data(FDCtrl *fdctrl)
         return 0;
     }
     pos = fdctrl->data_pos;
+    pos %= FD_SECTOR_LEN;
     if (fdctrl->msr & FD_MSR_NONDMA) {
-        pos %= FD_SECTOR_LEN;
         if (pos == 0) {
             if (fdctrl->data_pos != 0)
                 if (!fdctrl_seek_to_next_sect(fdctrl, cur_drv)) {
@@ -1867,10 +1893,13 @@ static void fdctrl_handle_option(FDCtrl *fdctrl, int direction)
 static void fdctrl_handle_drive_specification_command(FDCtrl *fdctrl, int direction)
 {
     FDrive *cur_drv = get_cur_drv(fdctrl);
+    uint32_t pos;
 
-    if (fdctrl->fifo[fdctrl->data_pos - 1] & 0x80) {
+    pos = fdctrl->data_pos - 1;
+    pos %= FD_SECTOR_LEN;
+    if (fdctrl->fifo[pos] & 0x80) {
         /* Command parameters done */
-        if (fdctrl->fifo[fdctrl->data_pos - 1] & 0x40) {
+        if (fdctrl->fifo[pos] & 0x40) {
             fdctrl->fifo[0] = fdctrl->fifo[1];
             fdctrl->fifo[2] = 0;
             fdctrl->fifo[3] = 0;
@@ -1970,7 +1999,7 @@ static uint8_t command_to_handler[256];
 static void fdctrl_write_data(FDCtrl *fdctrl, uint32_t value)
 {
     FDrive *cur_drv;
-    int pos;
+    uint32_t pos;
 
     /* Reset mode */
     if (!(fdctrl->dor & FD_DOR_nRESET)) {
@@ -2019,7 +2048,9 @@ static void fdctrl_write_data(FDCtrl *fdctrl, uint32_t value)
     }
 
     FLOPPY_DPRINTF("%s: %02x\n", __func__, value);
-    fdctrl->fifo[fdctrl->data_pos++] = value;
+    pos = fdctrl->data_pos++;
+    pos %= FD_SECTOR_LEN;
+    fdctrl->fifo[pos] = value;
     if (fdctrl->data_pos == fdctrl->data_len) {
         /* We now have all parameters
          * and will be able to treat the command
@@ -2350,6 +2381,7 @@ static void sysbus_fdc_class_init(ObjectClass *klass, void *data)
     DeviceClass *dc = DEVICE_CLASS(klass);
 
     dc->props = sysbus_fdc_properties;
+    dc->cannot_instantiate_with_device_add_yet = true; /* RH state preserve */
     set_bit(DEVICE_CATEGORY_STORAGE, dc->categories);
 }
 
@@ -2370,6 +2402,7 @@ static void sun4m_fdc_class_init(ObjectClass *klass, void *data)
     DeviceClass *dc = DEVICE_CLASS(klass);
 
     dc->props = sun4m_fdc_properties;
+    dc->cannot_instantiate_with_device_add_yet = true; /* RH state preserve */
     set_bit(DEVICE_CATEGORY_STORAGE, dc->categories);
 }
 

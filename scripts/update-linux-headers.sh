@@ -31,7 +31,7 @@ fi
 cp_virtio() {
     from=$1
     to=$2
-    virtio=$(find "$from" -name '*virtio*h')
+    virtio=$(find "$from" -name '*virtio*h' -o -name "input.h")
     if [ "$virtio" ]; then
         rm -rf "$to"
         mkdir -p "$to"
@@ -39,7 +39,9 @@ cp_virtio() {
             if
                 grep '#include' "$f" | grep -v -e 'linux/virtio' \
                                              -e 'linux/types' \
+                                             -e 'stdint' \
                                              -e 'linux/if_ether' \
+                                             -e 'sys/' \
                                              > /dev/null
             then
                 echo "Unexpected #include in input file $f".
@@ -48,6 +50,7 @@ cp_virtio() {
 
             header=$(basename "$f");
             sed -e 's/__u\([0-9][0-9]*\)/uint\1_t/g' \
+                -e 's/__s\([0-9][0-9]*\)/int\1_t/g' \
                 -e 's/__le\([0-9][0-9]*\)/uint\1_t/g' \
                 -e 's/__be\([0-9][0-9]*\)/uint\1_t/g' \
                 -e 's/<linux\/\([^>]*\)>/"standard-headers\/linux\/\1"/' \
@@ -71,7 +74,7 @@ for arch in $ARCHLIST; do
     fi
 
     # Blacklist architectures which have KVM headers but are actually dead
-    if [ "$arch" = "ia64" ]; then
+    if [ "$arch" = "ia64" -o "$arch" = "mips" ]; then
         continue
     fi
 
@@ -79,11 +82,14 @@ for arch in $ARCHLIST; do
 
     rm -rf "$output/linux-headers/asm-$arch"
     mkdir -p "$output/linux-headers/asm-$arch"
-    for header in kvm.h kvm_para.h; do
+    for header in kvm.h kvm_para.h unistd.h; do
         cp "$tmpdir/include/asm/$header" "$output/linux-headers/asm-$arch"
     done
     if [ $arch = x86 ]; then
         cp "$tmpdir/include/asm/hyperv.h" "$output/linux-headers/asm-x86"
+        cp "$tmpdir/include/asm/unistd_32.h" "$output/linux-headers/asm-x86/"
+        cp "$tmpdir/include/asm/unistd_x32.h" "$output/linux-headers/asm-x86/"
+        cp "$tmpdir/include/asm/unistd_64.h" "$output/linux-headers/asm-x86/"
     fi
     if [ $arch = powerpc ]; then
         cp "$tmpdir/include/asm/epapr_hcalls.h" "$output/linux-headers/asm-powerpc/"

@@ -1228,7 +1228,7 @@ int kvm_irqchip_add_msi_route(KVMState *s, MSIMessage msg)
     int virq;
 
     if (kvm_gsi_direct_mapping()) {
-        return msg.data & 0xffff;
+        return kvm_arch_msi_data_to_gsi(msg.data);
     }
 
     if (!kvm_gsi_routing_enabled()) {
@@ -1509,6 +1509,28 @@ static int kvm_init(MachineState *ms)
     soft_vcpus_limit = kvm_recommended_vcpus(s);
     hard_vcpus_limit = kvm_max_vcpus(s);
 
+#ifdef HOST_PPC64
+    /*
+     * RHEL hack:
+     *
+     * On POWER, the kernel advertises a soft limit based on the
+     * number of CPU threads on the host.  We want to allow exceeding
+     * this for testing purposes, so we don't want to set hard limit
+     * to soft limit as on x86.
+     *
+     * However the POWER hard limit advertised by the kernel is 2048
+     * (== NR_CPUS) but we only want to allow up to the number of
+     * vCPUs we actually test, so we force the hard limit to 240
+     */
+    hard_vcpus_limit = 240;
+    if (soft_vcpus_limit > hard_vcpus_limit) {
+        soft_vcpus_limit = hard_vcpus_limit;
+    }
+#else
+    /* RHEL doesn't support nr_vcpus > soft_vcpus_limit */
+    hard_vcpus_limit = soft_vcpus_limit;
+#endif
+
     while (nc->name) {
         if (nc->num > soft_vcpus_limit) {
             fprintf(stderr,
@@ -1633,6 +1655,12 @@ static int kvm_init(MachineState *ms)
     }
 
     kvm_state = s;
+
+    if (!kvm_eventfds_allowed) {
+        kvm_memory_listener.eventfd_add = NULL;
+        kvm_memory_listener.eventfd_del = NULL;
+    }
+
     memory_listener_register(&kvm_memory_listener, &address_space_memory);
     memory_listener_register(&kvm_io_listener, &address_space_io);
 
@@ -1667,7 +1695,8 @@ static void kvm_handle_io(uint16_t port, void *data, int direction, int size,
     uint8_t *ptr = data;
 
     for (i = 0; i < count; i++) {
-        address_space_rw(&address_space_io, port, ptr, size,
+        address_space_rw(&address_space_io, port, MEMTXATTRS_UNSPECIFIED,
+                         ptr, size,
                          direction == KVM_EXIT_IO_OUT);
         ptr += size;
     }
@@ -1816,6 +1845,14 @@ int kvm_cpu_exec(CPUState *cpu)
             }
             fprintf(stderr, "error: kvm run failed %s\n",
                     strerror(-run_ret));
+#ifdef TARGET_PPC
+            if (run_ret == -EBUSY) {
+                fprintf(stderr,
+                        "This is probably because your SMT is enabled.\n"
+                        "VCPU can only run on primary threads with all "
+                        "secondary threads offline.\n");
+            }
+#endif
             ret = -1;
             break;
         }

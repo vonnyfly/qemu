@@ -41,7 +41,7 @@ enum sPAPRTCEAccess {
 
 static QLIST_HEAD(spapr_tce_tables, sPAPRTCETable) spapr_tce_tables;
 
-static sPAPRTCETable *spapr_tce_find_by_liobn(uint32_t liobn)
+sPAPRTCETable *spapr_tce_find_by_liobn(uint32_t liobn)
 {
     sPAPRTCETable *tcet;
 
@@ -132,7 +132,7 @@ static int spapr_tce_table_realize(DeviceState *dev)
                                               tcet->nb_table <<
                                               tcet->page_shift,
                                               &tcet->fd,
-                                              tcet->vfio_accel);
+                                              tcet->need_vfio);
     }
 
     if (!tcet->table) {
@@ -154,11 +154,43 @@ static int spapr_tce_table_realize(DeviceState *dev)
     return 0;
 }
 
+void spapr_tce_set_need_vfio(sPAPRTCETable *tcet, bool need_vfio)
+{
+    size_t table_size = tcet->nb_table * sizeof(uint64_t);
+    void *newtable;
+
+    if (need_vfio == tcet->need_vfio) {
+        /* Nothing to do */
+        return;
+    }
+
+    if (!need_vfio) {
+        /* FIXME: We don't support transition back to KVM accelerated
+         * TCEs yet */
+        return;
+    }
+
+    tcet->need_vfio = true;
+
+    if (tcet->fd < 0) {
+        /* Table is already in userspace, nothing to be do */
+        return;
+    }
+
+    newtable = g_malloc(table_size);
+    memcpy(newtable, tcet->table, table_size);
+
+    kvmppc_remove_spapr_tce(tcet->table, tcet->fd, tcet->nb_table);
+
+    tcet->fd = -1;
+    tcet->table = newtable;
+}
+
 sPAPRTCETable *spapr_tce_new_table(DeviceState *owner, uint32_t liobn,
                                    uint64_t bus_offset,
                                    uint32_t page_shift,
                                    uint32_t nb_table,
-                                   bool vfio_accel)
+                                   bool need_vfio)
 {
     sPAPRTCETable *tcet;
 
@@ -177,7 +209,7 @@ sPAPRTCETable *spapr_tce_new_table(DeviceState *owner, uint32_t liobn,
     tcet->bus_offset = bus_offset;
     tcet->page_shift = page_shift;
     tcet->nb_table = nb_table;
-    tcet->vfio_accel = vfio_accel;
+    tcet->need_vfio = need_vfio;
 
     object_property_add_child(OBJECT(owner), "tce-table", OBJECT(tcet), NULL);
 
@@ -238,7 +270,7 @@ static target_ulong put_tce_emu(sPAPRTCETable *tcet, target_ulong ioba,
 }
 
 static target_ulong h_put_tce_indirect(PowerPCCPU *cpu,
-                                       sPAPREnvironment *spapr,
+                                       sPAPRMachineState *spapr,
                                        target_ulong opcode, target_ulong *args)
 {
     int i;
@@ -285,7 +317,7 @@ static target_ulong h_put_tce_indirect(PowerPCCPU *cpu,
     return ret;
 }
 
-static target_ulong h_stuff_tce(PowerPCCPU *cpu, sPAPREnvironment *spapr,
+static target_ulong h_stuff_tce(PowerPCCPU *cpu, sPAPRMachineState *spapr,
                               target_ulong opcode, target_ulong *args)
 {
     int i;
@@ -320,7 +352,7 @@ static target_ulong h_stuff_tce(PowerPCCPU *cpu, sPAPREnvironment *spapr,
     return ret;
 }
 
-static target_ulong h_put_tce(PowerPCCPU *cpu, sPAPREnvironment *spapr,
+static target_ulong h_put_tce(PowerPCCPU *cpu, sPAPRMachineState *spapr,
                               target_ulong opcode, target_ulong *args)
 {
     target_ulong liobn = args[0];
@@ -357,7 +389,7 @@ static target_ulong get_tce_emu(sPAPRTCETable *tcet, target_ulong ioba,
     return H_SUCCESS;
 }
 
-static target_ulong h_get_tce(PowerPCCPU *cpu, sPAPREnvironment *spapr,
+static target_ulong h_get_tce(PowerPCCPU *cpu, sPAPRMachineState *spapr,
                               target_ulong opcode, target_ulong *args)
 {
     target_ulong liobn = args[0];

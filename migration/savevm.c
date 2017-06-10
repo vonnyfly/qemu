@@ -2,6 +2,10 @@
  * QEMU System Emulator
  *
  * Copyright (c) 2003-2008 Fabrice Bellard
+ * Copyright (c) 2009-2015 Red Hat Inc
+ *
+ * Authors:
+ *  Juan Quintela <quintela@redhat.com>
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -35,6 +39,7 @@
 #include "migration/migration.h"
 #include "qemu/sockets.h"
 #include "qemu/queue.h"
+#include "qemu/rcu_queue.h"
 #include "sysemu/cpus.h"
 #include "exec/memory.h"
 #include "qmp-commands.h"
@@ -50,6 +55,8 @@
 #define ARP_HTYPE_ETH 0x0001
 #define ARP_PTYPE_IP 0x0800
 #define ARP_OP_REQUEST_REV 0x3
+
+bool shadow_bios_after_incoming;
 
 static int announce_self_create(uint8_t *buf,
                                 uint8_t *mac_addr)
@@ -235,10 +242,59 @@ typedef struct SaveStateEntry {
     int is_ram;
 } SaveStateEntry;
 
+typedef struct SaveState {
+    QTAILQ_HEAD(, SaveStateEntry) handlers;
+    int global_section_id;
+    bool skip_configuration;
+    uint32_t len;
+    const char *name;
+} SaveState;
 
-static QTAILQ_HEAD(savevm_handlers, SaveStateEntry) savevm_handlers =
-    QTAILQ_HEAD_INITIALIZER(savevm_handlers);
-static int global_section_id;
+static SaveState savevm_state = {
+    .handlers = QTAILQ_HEAD_INITIALIZER(savevm_state.handlers),
+    .global_section_id = 0,
+    .skip_configuration = false,
+};
+
+void savevm_skip_configuration(void)
+{
+    savevm_state.skip_configuration = true;
+}
+
+
+static void configuration_pre_save(void *opaque)
+{
+    SaveState *state = opaque;
+    const char *current_name = MACHINE_GET_CLASS(current_machine)->name;
+
+    state->len = strlen(current_name);
+    state->name = current_name;
+}
+
+static int configuration_post_load(void *opaque, int version_id)
+{
+    SaveState *state = opaque;
+    const char *current_name = MACHINE_GET_CLASS(current_machine)->name;
+
+    if (strncmp(state->name, current_name, state->len) != 0) {
+        error_report("Machine type received is '%s' and local is '%s'",
+                     state->name, current_name);
+        return -EINVAL;
+    }
+    return 0;
+}
+
+static const VMStateDescription vmstate_configuration = {
+    .name = "configuration",
+    .version_id = 1,
+    .post_load = configuration_post_load,
+    .pre_save = configuration_pre_save,
+    .fields = (VMStateField[]) {
+        VMSTATE_UINT32(len, SaveState),
+        VMSTATE_VBUFFER_ALLOC_UINT32(name, SaveState, 0, NULL, 0, len),
+        VMSTATE_END_OF_LIST()
+    },
+};
 
 static void dump_vmstate_vmsd(FILE *out_file,
                               const VMStateDescription *vmsd, int indent,
@@ -263,11 +319,11 @@ static void dump_vmstate_vmsf(FILE *out_file, const VMStateField *field,
 }
 
 static void dump_vmstate_vmss(FILE *out_file,
-                              const VMStateSubsection *subsection,
+                              const VMStateDescription **subsection,
                               int indent)
 {
-    if (subsection->vmsd != NULL) {
-        dump_vmstate_vmsd(out_file, subsection->vmsd, indent, true);
+    if (*subsection != NULL) {
+        dump_vmstate_vmsd(out_file, *subsection, indent, true);
     }
 }
 
@@ -308,12 +364,12 @@ static void dump_vmstate_vmsd(FILE *out_file,
         fprintf(out_file, "\n%*s]", indent, "");
     }
     if (vmsd->subsections != NULL) {
-        const VMStateSubsection *subsection = vmsd->subsections;
+        const VMStateDescription **subsection = vmsd->subsections;
         bool first;
 
         fprintf(out_file, ",\n%*s\"Subsections\": [\n", indent, "");
         first = true;
-        while (subsection->vmsd != NULL) {
+        while (*subsection != NULL) {
             if (!first) {
                 fprintf(out_file, ",\n");
             }
@@ -383,7 +439,7 @@ static int calculate_new_instance_id(const char *idstr)
     SaveStateEntry *se;
     int instance_id = 0;
 
-    QTAILQ_FOREACH(se, &savevm_handlers, entry) {
+    QTAILQ_FOREACH(se, &savevm_state.handlers, entry) {
         if (strcmp(idstr, se->idstr) == 0
             && instance_id <= se->instance_id) {
             instance_id = se->instance_id + 1;
@@ -397,7 +453,7 @@ static int calculate_compat_instance_id(const char *idstr)
     SaveStateEntry *se;
     int instance_id = 0;
 
-    QTAILQ_FOREACH(se, &savevm_handlers, entry) {
+    QTAILQ_FOREACH(se, &savevm_state.handlers, entry) {
         if (!se->compat) {
             continue;
         }
@@ -425,7 +481,7 @@ int register_savevm_live(DeviceState *dev,
 
     se = g_malloc0(sizeof(SaveStateEntry));
     se->version_id = version_id;
-    se->section_id = global_section_id++;
+    se->section_id = savevm_state.global_section_id++;
     se->ops = ops;
     se->opaque = opaque;
     se->vmsd = NULL;
@@ -457,7 +513,7 @@ int register_savevm_live(DeviceState *dev,
     }
     assert(!se->compat || se->instance_id == 0);
     /* add at the end of list */
-    QTAILQ_INSERT_TAIL(&savevm_handlers, se, entry);
+    QTAILQ_INSERT_TAIL(&savevm_state.handlers, se, entry);
     return 0;
 }
 
@@ -491,9 +547,9 @@ void unregister_savevm(DeviceState *dev, const char *idstr, void *opaque)
     }
     pstrcat(id, sizeof(id), idstr);
 
-    QTAILQ_FOREACH_SAFE(se, &savevm_handlers, entry, new_se) {
+    QTAILQ_FOREACH_SAFE(se, &savevm_state.handlers, entry, new_se) {
         if (strcmp(se->idstr, id) == 0 && se->opaque == opaque) {
-            QTAILQ_REMOVE(&savevm_handlers, se, entry);
+            QTAILQ_REMOVE(&savevm_state.handlers, se, entry);
             if (se->compat) {
                 g_free(se->compat);
             }
@@ -515,7 +571,7 @@ int vmstate_register_with_alias_id(DeviceState *dev, int instance_id,
 
     se = g_malloc0(sizeof(SaveStateEntry));
     se->version_id = vmsd->version_id;
-    se->section_id = global_section_id++;
+    se->section_id = savevm_state.global_section_id++;
     se->opaque = opaque;
     se->vmsd = vmsd;
     se->alias_id = alias_id;
@@ -543,7 +599,7 @@ int vmstate_register_with_alias_id(DeviceState *dev, int instance_id,
     }
     assert(!se->compat || se->instance_id == 0);
     /* add at the end of list */
-    QTAILQ_INSERT_TAIL(&savevm_handlers, se, entry);
+    QTAILQ_INSERT_TAIL(&savevm_state.handlers, se, entry);
     return 0;
 }
 
@@ -552,9 +608,9 @@ void vmstate_unregister(DeviceState *dev, const VMStateDescription *vmsd,
 {
     SaveStateEntry *se, *new_se;
 
-    QTAILQ_FOREACH_SAFE(se, &savevm_handlers, entry, new_se) {
+    QTAILQ_FOREACH_SAFE(se, &savevm_state.handlers, entry, new_se) {
         if (se->vmsd == vmsd && se->opaque == opaque) {
-            QTAILQ_REMOVE(&savevm_handlers, se, entry);
+            QTAILQ_REMOVE(&savevm_state.handlers, se, entry);
             if (se->compat) {
                 g_free(se->compat);
             }
@@ -606,7 +662,7 @@ bool qemu_savevm_state_blocked(Error **errp)
 {
     SaveStateEntry *se;
 
-    QTAILQ_FOREACH(se, &savevm_handlers, entry) {
+    QTAILQ_FOREACH(se, &savevm_state.handlers, entry) {
         if (se->vmsd && se->vmsd->unmigratable) {
             error_setg(errp, "State blocked by non-migratable device '%s'",
                        se->idstr);
@@ -623,7 +679,7 @@ void qemu_savevm_state_begin(QEMUFile *f,
     int ret;
 
     trace_savevm_state_begin();
-    QTAILQ_FOREACH(se, &savevm_handlers, entry) {
+    QTAILQ_FOREACH(se, &savevm_state.handlers, entry) {
         if (!se->ops || !se->ops->set_params) {
             continue;
         }
@@ -633,7 +689,12 @@ void qemu_savevm_state_begin(QEMUFile *f,
     qemu_put_be32(f, QEMU_VM_FILE_MAGIC);
     qemu_put_be32(f, QEMU_VM_FILE_VERSION);
 
-    QTAILQ_FOREACH(se, &savevm_handlers, entry) {
+    if (!savevm_state.skip_configuration) {
+        qemu_put_byte(f, QEMU_VM_CONFIGURATION);
+        vmstate_save_state(f, &vmstate_configuration, &savevm_state, 0);
+    }
+
+    QTAILQ_FOREACH(se, &savevm_state.handlers, entry) {
         int len;
 
         if (!se->ops || !se->ops->save_live_setup) {
@@ -676,7 +737,7 @@ int qemu_savevm_state_iterate(QEMUFile *f)
     int ret = 1;
 
     trace_savevm_state_iterate();
-    QTAILQ_FOREACH(se, &savevm_handlers, entry) {
+    QTAILQ_FOREACH(se, &savevm_state.handlers, entry) {
         if (!se->ops || !se->ops->save_live_iterate) {
             continue;
         }
@@ -727,7 +788,7 @@ void qemu_savevm_state_complete(QEMUFile *f)
 
     cpu_synchronize_all_states();
 
-    QTAILQ_FOREACH(se, &savevm_handlers, entry) {
+    QTAILQ_FOREACH(se, &savevm_state.handlers, entry) {
         if (!se->ops || !se->ops->save_live_complete) {
             continue;
         }
@@ -752,12 +813,17 @@ void qemu_savevm_state_complete(QEMUFile *f)
     vmdesc = qjson_new();
     json_prop_int(vmdesc, "page_size", TARGET_PAGE_SIZE);
     json_start_array(vmdesc, "devices");
-    QTAILQ_FOREACH(se, &savevm_handlers, entry) {
+    QTAILQ_FOREACH(se, &savevm_state.handlers, entry) {
         int len;
 
         if ((!se->ops || !se->ops->save_state) && !se->vmsd) {
             continue;
         }
+        if (se->vmsd && !vmstate_save_needed(se->vmsd, se->opaque)) {
+            trace_savevm_section_skip(se->idstr, se->section_id);
+            continue;
+        }
+
         trace_savevm_section_start(se->idstr, se->section_id);
 
         json_start_object(vmdesc, NULL);
@@ -803,7 +869,7 @@ uint64_t qemu_savevm_state_pending(QEMUFile *f, uint64_t max_size)
     SaveStateEntry *se;
     uint64_t ret = 0;
 
-    QTAILQ_FOREACH(se, &savevm_handlers, entry) {
+    QTAILQ_FOREACH(se, &savevm_state.handlers, entry) {
         if (!se->ops || !se->ops->save_live_pending) {
             continue;
         }
@@ -822,7 +888,7 @@ void qemu_savevm_state_cancel(void)
     SaveStateEntry *se;
 
     trace_savevm_state_cancel();
-    QTAILQ_FOREACH(se, &savevm_handlers, entry) {
+    QTAILQ_FOREACH(se, &savevm_state.handlers, entry) {
         if (se->ops && se->ops->cancel) {
             se->ops->cancel(se->opaque);
         }
@@ -872,13 +938,16 @@ static int qemu_save_device_state(QEMUFile *f)
 
     cpu_synchronize_all_states();
 
-    QTAILQ_FOREACH(se, &savevm_handlers, entry) {
+    QTAILQ_FOREACH(se, &savevm_state.handlers, entry) {
         int len;
 
         if (se->is_ram) {
             continue;
         }
         if ((!se->ops || !se->ops->save_state) && !se->vmsd) {
+            continue;
+        }
+        if (se->vmsd && !vmstate_save_needed(se->vmsd, se->opaque)) {
             continue;
         }
 
@@ -906,7 +975,7 @@ static SaveStateEntry *find_se(const char *idstr, int instance_id)
 {
     SaveStateEntry *se;
 
-    QTAILQ_FOREACH(se, &savevm_handlers, entry) {
+    QTAILQ_FOREACH(se, &savevm_state.handlers, entry) {
         if (!strcmp(se->idstr, idstr) &&
             (instance_id == se->instance_id ||
              instance_id == se->alias_id))
@@ -928,6 +997,65 @@ typedef struct LoadStateEntry {
     int section_id;
     int version_id;
 } LoadStateEntry;
+
+static void shadow_bios(void)
+{
+    RAMBlock *block, *ram, *oprom, *bios;
+    size_t one_meg, oprom_size, bios_size;
+    uint8_t *cd_seg_host, *ef_seg_host;
+
+    ram = NULL;
+    oprom = NULL;
+    bios = NULL;
+    rcu_read_lock();
+    QLIST_FOREACH_RCU(block, &ram_list.blocks, next) {
+        if (strcmp("pc.ram", block->idstr) == 0) {
+            assert(ram == NULL);
+            ram = block;
+        } else if (strcmp("pc.rom", block->idstr) == 0) {
+            assert(oprom == NULL);
+            oprom = block;
+        } else if (strcmp("pc.bios", block->idstr) == 0) {
+            assert(bios == NULL);
+            bios = block;
+        }
+    }
+    assert(ram != NULL);
+    assert(oprom != NULL);
+    assert(bios != NULL);
+    assert(memory_region_is_ram(ram->mr));
+    assert(memory_region_is_ram(oprom->mr));
+    assert(memory_region_is_ram(bios->mr));
+    assert(int128_eq(ram->mr->size, int128_make64(ram->used_length)));
+    assert(int128_eq(oprom->mr->size, int128_make64(oprom->used_length)));
+    assert(int128_eq(bios->mr->size, int128_make64(bios->used_length)));
+
+    one_meg = 1024 * 1024;
+    oprom_size = 128 * 1024;
+    bios_size = 128 * 1024;
+    assert(ram->used_length >= one_meg);
+    assert(oprom->used_length == oprom_size);
+    assert(bios->used_length == bios_size);
+
+    ef_seg_host = memory_region_get_ram_ptr(ram->mr) + (one_meg - bios_size);
+    cd_seg_host = ef_seg_host - oprom_size;
+
+    /* This is a crude hack, but we must distinguish a rhel6.x.0 machtype guest
+     * coming in from a RHEL-6 emulator (where shadowing has had no effect on
+     * "pc.ram") from a similar guest coming in from a RHEL-7 emulator (where
+     * shadowing has worked). In the latter case we must not trample the live
+     * SeaBIOS variables in "pc.ram".
+     */
+    if (buffer_is_zero(ef_seg_host, bios_size)) {
+        fprintf(stderr, "copying E and F segments from pc.bios to pc.ram\n");
+        memcpy(ef_seg_host, memory_region_get_ram_ptr(bios->mr), bios_size);
+    }
+    if (buffer_is_zero(cd_seg_host, oprom_size)) {
+        fprintf(stderr, "copying C and D segments from pc.rom to pc.ram\n");
+        memcpy(cd_seg_host, memory_region_get_ram_ptr(oprom->mr), oprom_size);
+    }
+    rcu_read_unlock();
+}
 
 int qemu_loadvm_state(QEMUFile *f)
 {
@@ -961,11 +1089,22 @@ int qemu_loadvm_state(QEMUFile *f)
         return -ENOTSUP;
     }
 
+    if (!savevm_state.skip_configuration) {
+        if (qemu_get_byte(f) != QEMU_VM_CONFIGURATION) {
+            error_report("Configuration section missing");
+            return -EINVAL;
+        }
+        ret = vmstate_load_state(f, &vmstate_configuration, &savevm_state, 0);
+
+        if (ret) {
+            return ret;
+        }
+    }
+
     while ((section_type = qemu_get_byte(f)) != QEMU_VM_EOF) {
         uint32_t instance_id, version_id, section_id;
         SaveStateEntry *se;
-        char idstr[257];
-        int len;
+        char idstr[256];
 
         trace_qemu_loadvm_state_section(section_type);
         switch (section_type) {
@@ -973,9 +1112,11 @@ int qemu_loadvm_state(QEMUFile *f)
         case QEMU_VM_SECTION_FULL:
             /* Read section start */
             section_id = qemu_get_be32(f);
-            len = qemu_get_byte(f);
-            qemu_get_buffer(f, (uint8_t *)idstr, len);
-            idstr[len] = 0;
+            if (!qemu_get_counted_string(f, idstr)) {
+                error_report("Unable to read ID string for section %u",
+                            section_id);
+                return -EINVAL;
+            }
             instance_id = qemu_get_be32(f);
             version_id = qemu_get_be32(f);
 
@@ -1049,16 +1190,42 @@ int qemu_loadvm_state(QEMUFile *f)
      * Try to read in the VMDESC section as well, so that dumping tools that
      * intercept our migration stream have the chance to see it.
      */
-    if (qemu_get_byte(f) == QEMU_VM_VMDESCRIPTION) {
-        uint32_t size = qemu_get_be32(f);
-        uint8_t *buf = g_malloc(0x1000);
 
-        while (size > 0) {
-            uint32_t read_chunk = MIN(size, 0x1000);
-            qemu_get_buffer(f, buf, read_chunk);
-            size -= read_chunk;
+    /* We've got to be careful; if we don't read the data and just shut the fd
+     * then the sender can error if we close while it's still sending.
+     * We also mustn't read data that isn't there; some transports (RDMA)
+     * will stall waiting for that data when the source has already closed.
+     */
+    if (should_send_vmdesc()) {
+        uint8_t *buf;
+        uint32_t size;
+        section_type = qemu_get_byte(f);
+
+        if (section_type != QEMU_VM_VMDESCRIPTION) {
+            error_report("Expected vmdescription section, but got %d",
+                         section_type);
+            /*
+             * It doesn't seem worth failing at this point since
+             * we apparently have an otherwise valid VM state
+             */
+        } else {
+            buf = g_malloc(0x1000);
+            size = qemu_get_be32(f);
+
+            while (size > 0) {
+                uint32_t read_chunk = MIN(size, 0x1000);
+                qemu_get_buffer(f, buf, read_chunk);
+                size -= read_chunk;
+            }
+            g_free(buf);
         }
-        g_free(buf);
+    }
+
+    /* Supplement SeaBIOS's shadowing now, because it was useless when the
+     * incoming VM started on the RHEL-6 emulator.
+     */
+    if (shadow_bios_after_incoming) {
+        shadow_bios();
     }
 
     cpu_synchronize_all_post_init();
@@ -1154,6 +1321,12 @@ void hmp_savevm(Monitor *mon, const QDict *qdict)
     }
 
     saved_vm_running = runstate_is_running();
+
+    ret = global_state_store();
+    if (ret) {
+        monitor_printf(mon, "Error saving global state\n");
+        return;
+    }
     vm_stop(RUN_STATE_SAVE_VM);
 
     memset(sn, 0, sizeof(*sn));

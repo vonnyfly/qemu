@@ -2461,6 +2461,7 @@ void qmp_drive_mirror(const char *device, const char *target,
                       bool has_buf_size, int64_t buf_size,
                       bool has_on_source_error, BlockdevOnError on_source_error,
                       bool has_on_target_error, BlockdevOnError on_target_error,
+                      bool has_unmap, bool unmap,
                       Error **errp)
 {
     BlockBackend *blk;
@@ -2491,6 +2492,9 @@ void qmp_drive_mirror(const char *device, const char *target,
     }
     if (!has_buf_size) {
         buf_size = DEFAULT_MIRROR_BUF_SIZE;
+    }
+    if (!has_unmap) {
+        unmap = true;
     }
 
     if (granularity != 0 && (granularity < 512 || granularity > 1048576 * 64)) {
@@ -2631,6 +2635,7 @@ void qmp_drive_mirror(const char *device, const char *target,
                  has_replaces ? replaces : NULL,
                  speed, granularity, buf_size, sync,
                  on_source_error, on_target_error,
+                 unmap,
                  block_job_cb, bs, &local_err);
     if (local_err != NULL) {
         bdrv_unref(target_bs);
@@ -2699,7 +2704,7 @@ void qmp_block_job_cancel(const char *device,
         force = false;
     }
 
-    if (job->paused && !force) {
+    if (job->user_paused && !force) {
         error_setg(errp, "The block job for device '%s' is currently paused",
                    device);
         goto out;
@@ -2716,10 +2721,11 @@ void qmp_block_job_pause(const char *device, Error **errp)
     AioContext *aio_context;
     BlockJob *job = find_block_job(device, &aio_context, errp);
 
-    if (!job) {
+    if (!job || job->user_paused) {
         return;
     }
 
+    job->user_paused = true;
     trace_qmp_block_job_pause(job);
     block_job_pause(job);
     aio_context_release(aio_context);
@@ -2730,10 +2736,11 @@ void qmp_block_job_resume(const char *device, Error **errp)
     AioContext *aio_context;
     BlockJob *job = find_block_job(device, &aio_context, errp);
 
-    if (!job) {
+    if (!job || !job->user_paused) {
         return;
     }
 
+    job->user_paused = false;
     trace_qmp_block_job_resume(job);
     block_job_resume(job);
     aio_context_release(aio_context);
@@ -3039,4 +3046,18 @@ QemuOptsList qemu_drive_opts = {
          */
         { /* end of list */ }
     },
+};
+
+QemuOptsList qemu_simple_drive_opts = {
+    .name = "simple-drive",
+    .implied_opt_name = "format",
+    .head = QTAILQ_HEAD_INITIALIZER(qemu_simple_drive_opts.head),
+    .desc = {
+        /*
+         * no elements => accept any
+         * sanity checking will happen later
+         * when setting device properties
+         */
+        { /* end if list */ }
+    }
 };

@@ -28,6 +28,7 @@
 #include "qapi/visitor.h"
 #include "qapi-event.h"
 #include "qmp-commands.h"
+#include "migration/migration.h"
 
 #ifdef TARGET_I386
 #include "hw/i386/apic.h"
@@ -733,21 +734,27 @@ static int rtc_post_load(void *opaque, int version_id)
     return 0;
 }
 
+static bool rtc_irq_reinject_on_ack_count_needed(void *opaque)
+{
+    RTCState *s = (RTCState *)opaque;
+
+    if (migrate_pre_2_2) {
+        return false;
+    }
+
+    return s->irq_reinject_on_ack_count != 0;
+}
+
 static const VMStateDescription vmstate_rtc_irq_reinject_on_ack_count = {
     .name = "mc146818rtc/irq_reinject_on_ack_count",
     .version_id = 1,
     .minimum_version_id = 1,
+    .needed = rtc_irq_reinject_on_ack_count_needed,
     .fields = (VMStateField[]) {
         VMSTATE_UINT16(irq_reinject_on_ack_count, RTCState),
         VMSTATE_END_OF_LIST()
     }
 };
-
-static bool rtc_irq_reinject_on_ack_count_needed(void *opaque)
-{
-    RTCState *s = (RTCState *)opaque;
-    return s->irq_reinject_on_ack_count != 0;
-}
 
 static const VMStateDescription vmstate_rtc = {
     .name = "mc146818rtc",
@@ -770,13 +777,9 @@ static const VMStateDescription vmstate_rtc = {
         VMSTATE_UINT64_V(next_alarm_time, RTCState, 3),
         VMSTATE_END_OF_LIST()
     },
-    .subsections = (VMStateSubsection[]) {
-        {
-            .vmsd = &vmstate_rtc_irq_reinject_on_ack_count,
-            .needed = rtc_irq_reinject_on_ack_count_needed,
-        }, {
-            /* empty */
-        }
+    .subsections = (const VMStateDescription*[]) {
+        &vmstate_rtc_irq_reinject_on_ack_count,
+        NULL
     }
 };
 
